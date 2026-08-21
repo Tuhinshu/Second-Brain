@@ -1,0 +1,1 @@
+import{W as e}from"./protobuf.CBn3jIav.js";var t={[e.ButtonLikeIconPosition.LEFT]:`left`,[e.ButtonLikeIconPosition.RIGHT]:`right`};function n(n){return t[n??e.ButtonLikeIconPosition.LEFT]}export{n as t};
