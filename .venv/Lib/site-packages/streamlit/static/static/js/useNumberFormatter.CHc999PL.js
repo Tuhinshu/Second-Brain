@@ -1,1 +1,0 @@
-import{o as e}from"./rolldown-runtime.DAXXjFlN.js";import{r as t}from"./emotion-is-prop-valid.esm.CygBv61C.js";import{C as n}from"./Tooltip.DJg7muty.js";import{t as r}from"./NumberFormatter.C77iRD8u.js";var i=e(t(),1);function a(e={}){let{locale:t}=n();return(0,i.useMemo)(()=>new r(t,e),[t,e])}export{a as t};
