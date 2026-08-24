@@ -7,6 +7,7 @@ from notion_service import (
     fetch_active_tasks,
     create_task,
     update_task_status,
+    delete_task,
     inject_template_blocks_if_empty,
     fetch_assets,
 )
@@ -67,19 +68,23 @@ def add_task_dialog():
     render_add_task_form(key_suffix="_dialog")
 
 
+import os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def get_base64_of_bin_file(bin_file):
     with open(bin_file, 'rb') as f:
         data = f.read()
     return base64.b64encode(data).decode()
 
 try:
-    img_b64 = get_base64_of_bin_file(r"D:\Second_Brain_Execution_Engine\Cover.jpg")
+    img_b64 = get_base64_of_bin_file(os.path.join(CURRENT_DIR, "Cover.jpg"))
     bg_style = f"background: linear-gradient(rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.55)), url('data:image/jpeg;base64,{img_b64}') center/cover no-repeat;"
 except Exception:
     bg_style = "background: #1e293b;"
 
 try:
-    bg_page_b64 = get_base64_of_bin_file(r"D:\Second_Brain_Execution_Engine\bg.jpg")
+    bg_page_b64 = get_base64_of_bin_file(os.path.join(CURRENT_DIR, "bg.jpg"))
     page_bg_css = f"linear-gradient(135deg, rgba(255, 253, 247, 0.82) 0%, rgba(245, 239, 225, 0.86) 100%), url('data:image/jpeg;base64,{bg_page_b64}')"
 except Exception:
     page_bg_css = "linear-gradient(135deg, rgba(255, 253, 247, 0.95), rgba(245, 239, 225, 0.95))"
@@ -266,7 +271,7 @@ if st.session_state.active_page == "24-Hour Execution Arena":
             card_border = is_active or (idx == 0)
 
             with st.container(border=card_border):
-                c_info, c_actions = st.columns([3, 2])
+                c_info, c_actions = st.columns([1.6, 1.4])
 
                 with c_info:
                     status_badge = f"**[{task.status.upper()}]**" if is_active else f"[{task.status}]"
@@ -282,28 +287,36 @@ if st.session_state.active_page == "24-Hour Execution Arena":
 
                 with c_actions:
                     st.write("")
-                    col_b1, col_b2, col_b3 = st.columns(3)
+                    col_b1, col_b2, col_b3 = st.columns([1.1, 1.2, 0.9])
                     if task.status != "In progress":
                         if col_b1.button("Start", key=f"start_{task.id}", use_container_width=True):
                             update_task_status(task.id, "In progress")
                             inject_template_blocks_if_empty(task.id)
                             st.toast(f"Started: {task.task_name}")
                             st.rerun()
-                            
-                    if task.status == "In progress":
-                        if col_b2.button("Pause", key=f"pause_{task.id}", use_container_width=True):
+                    else:
+                        if col_b1.button("Pause", key=f"pause_{task.id}", use_container_width=True):
                             st.session_state.pause_prompt_id = task.id
                             st.rerun()
-                    if col_b3.button("Complete", key=f"done_{task.id}", use_container_width=True, type="primary" if is_active else "secondary"):
+
+                    if col_b2.button("Complete", key=f"done_{task.id}", use_container_width=True, type="primary" if is_active else "secondary"):
                         update_task_status(task.id, "Done")
                         st.toast(f"Completed: {task.task_name}")
                         st.rerun()
+
+                    if col_b3.button("🗑️ Delete", key=f"del_{task.id}", use_container_width=True):
+                        try:
+                            delete_task(task.id)
+                            st.toast(f"Deleted: {task.task_name}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to delete task: {str(e)}")
 
         if backlog_tasks:
             st.write("")
             with st.expander(f"Backlog Drawer ({len(backlog_tasks)} Remaining Tasks)"):
                 for b_task in backlog_tasks:
-                    b_col1, b_col2 = st.columns([4, 1])
+                    b_col1, b_col2, b_col3 = st.columns([4, 1.2, 0.9])
                     with b_col1:
                         st.markdown(
                             f"• **{b_task.task_name}** (`{b_task.domain}`) — "
@@ -314,6 +327,14 @@ if st.session_state.active_page == "24-Hour Execution Arena":
                             update_task_status(b_task.id, "Not started")
                             st.toast(f"Promoted {b_task.task_name} to active queue!")
                             st.rerun()
+                    with b_col3:
+                        if st.button("🗑️ Delete", key=f"del_{b_task.id}", use_container_width=True):
+                            try:
+                                delete_task(b_task.id)
+                                st.toast(f"Deleted: {b_task.task_name}")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to delete task: {str(e)}")
 
 elif st.session_state.active_page == "Reusable Asset Vault":
     st.subheader("Resources")

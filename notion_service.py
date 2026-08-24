@@ -119,6 +119,11 @@ def update_task_status(page_id: str, new_status: str, state_anchor: Optional[str
     notion.pages.update(page_id=page_id, properties=properties)
 
 
+def delete_task(page_id: str) -> None:
+    """Archive/delete a task page in Notion."""
+    notion.pages.update(page_id=page_id, archived=True)
+
+
 def inject_template_blocks_if_empty(page_id: str) -> None:
     blocks = notion.blocks.children.list(block_id=page_id)
     if not blocks.get("results"):
