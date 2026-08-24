@@ -3,12 +3,6 @@
   Second Brain Execution Engine
  *Algorithmic Task Scoring, State Anchoring & Frictionless Notion Cockpit*
 
-[![Python](https://img.shields.io/badge/Python3.10%2B3776AB?style=forthebadge&logo=python&logoColor=white)](https://www.python.org/)
-[![Streamlit](https://img.shields.io/badge/Streamlit1.35%2BFF4B4B?style=forthebadge&logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![Notion API](https://img.shields.io/badge/Notion%20APIv2000000?style=forthebadge&logo=notion&logoColor=white)](https://developers.notion.com/)
-[![Pydantic](https://img.shields.io/badge/Pydanticv2.7%2BE92063?style=forthebadge&logo=pydantic&logoColor=white)](https://docs.pydantic.dev/)
-[![License: MIT](https://img.shields.io/badge/LicenseMITyellow.svg?style=forthebadge)](LICENSE)
-
 <br />
 
 <p align="center">
