@@ -69,8 +69,9 @@ class TestNotionParsing(unittest.TestCase):
         self.assertEqual(task.state_anchor, "Open section 3 and add pricing")
 
     def test_parse_task_page_resilient_defaults(self):
-        # Empty properties dict
-        task = parse_task_page({"id": "empty-page", "properties": {}})
+        # Empty properties dict emits structured warning logs
+        with self.assertLogs("second_brain.service", level="WARNING") as cm:
+            task = parse_task_page({"id": "empty-page", "properties": {}})
         self.assertEqual(task.task_name, "Untitled Task")
         self.assertEqual(task.status, "Not started")
         self.assertEqual(task.domain, "Personal")
@@ -79,6 +80,9 @@ class TestNotionParsing(unittest.TestCase):
         self.assertEqual(task.estimated_hours, 1.0)
         self.assertFalse(task.someone_waiting)
         self.assertIsNone(task.state_anchor)
+        self.assertTrue(any("missing title property" in log for log in cm.output))
+        self.assertTrue(any("invalid or missing status" in log for log in cm.output))
+        self.assertTrue(any("invalid or missing domain" in log for log in cm.output))
 
     def test_parse_asset_page(self):
         raw_asset = {

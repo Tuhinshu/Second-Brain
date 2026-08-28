@@ -1,11 +1,26 @@
-import time
+import logging
 import random
-from typing import List, Optional, Callable, TypeVar, Any
+import time
+from typing import Any, Callable, List, Optional, TypeVar
+
 import streamlit as st
 from notion_client import Client
-from notion_client.errors import APIResponseError, RequestTimeoutError, HTTPResponseError
+from notion_client.errors import APIResponseError, HTTPResponseError, RequestTimeoutError
+
 import config
-from Models import TaskModel, AssetModel, TaskStatus, TaskDomain
+from Models import (
+    AssetModel,
+    InvalidStateTransitionError,
+    NotionServiceError,
+    TaskDomain,
+    TaskLimitError,
+    TaskModel,
+    TaskStatus,
+    TaskValidationError,
+    VALID_STATE_TRANSITIONS,
+)
+
+logger = logging.getLogger("second_brain.service")
 
 T = TypeVar("T")
 RETRYABLE_STATUS_CODES: set[int] = {429, 500, 502, 503, 504}
@@ -91,12 +106,14 @@ def _parse_float_prop(prop: Optional[dict], default: float = 1.0, min_val: float
 def parse_task_page(page: dict) -> TaskModel:
     if not isinstance(page, dict):
         page = {}
+    page_id = str(page.get("id", ""))
     props = page.get("properties", {})
     if not isinstance(props, dict):
         props = {}
 
     task_name = _extract_plain_text(props.get("Task Name"), key="title")
     if not task_name:
+        logger.warning("Task page %s is missing title property; defaulting to 'Untitled Task'.", page_id)
         task_name = "Untitled Task"
 
     status_prop = props.get("Status")
@@ -104,12 +121,30 @@ def parse_task_page(page: dict) -> TaskModel:
     if isinstance(status_prop, dict):
         status_obj = status_prop.get("status") or status_prop.get("select")
     raw_status = status_obj.get("name") if isinstance(status_obj, dict) else None
-    status: TaskStatus = raw_status if raw_status in VALID_STATUSES else "Not started"
+    if raw_status in VALID_STATUSES:
+        status: TaskStatus = raw_status
+    else:
+        logger.warning(
+            "Task page %s ('%s') has invalid or missing status '%s'; defaulting to 'Not started'.",
+            page_id,
+            task_name,
+            raw_status,
+        )
+        status = "Not started"
 
     domain_prop = props.get("Domain")
     domain_obj = domain_prop.get("select") if isinstance(domain_prop, dict) else None
     raw_domain = domain_obj.get("name") if isinstance(domain_obj, dict) else None
-    domain: TaskDomain = raw_domain if raw_domain in VALID_DOMAINS else "Personal"
+    if raw_domain in VALID_DOMAINS:
+        domain: TaskDomain = raw_domain
+    else:
+        logger.warning(
+            "Task page %s ('%s') has invalid or missing domain '%s'; defaulting to 'Personal'.",
+            page_id,
+            task_name,
+            raw_domain,
+        )
+        domain = "Personal"
 
     impact = _parse_int_prop(props.get("Impact"), default=3, min_val=1, max_val=5)
     urgency = _parse_int_prop(props.get("Urgency"), default=3, min_val=1, max_val=5)
@@ -122,7 +157,7 @@ def parse_task_page(page: dict) -> TaskModel:
     state_anchor = state_anchor_text if state_anchor_text else None
 
     return TaskModel(
-        id=str(page.get("id", "")),
+        id=page_id,
         task_name=task_name,
         status=status,
         domain=domain,
@@ -136,12 +171,14 @@ def parse_task_page(page: dict) -> TaskModel:
 def parse_asset_page(page: dict) -> AssetModel:
     if not isinstance(page, dict):
         page = {}
+    page_id = str(page.get("id", ""))
     props = page.get("properties", {})
     if not isinstance(props, dict):
         props = {}
 
     title = _extract_plain_text(props.get("Title"), key="title")
     if not title:
+        logger.warning("Asset page %s is missing title property; defaulting to 'Untitled Asset'.", page_id)
         title = "Untitled Asset"
 
     type_prop = props.get("Type")
@@ -222,38 +259,86 @@ def create_new_task(
     urgency: int = 3,
     estimated_hours: float = 1.0,
     someone_waiting: bool = False,
-) -> tuple[bool, str]:
+) -> TaskModel:
     """
     Validates business rules and executes task creation in Notion.
-    Returns (success: bool, message: str).
+
+    Raises:
+        TaskValidationError: If task title is empty.
+        TaskLimitError: If active task capacity is reached.
+        NotionServiceError: If Notion API persistence fails.
+
+    Returns:
+        TaskModel: The created and initialized task model.
     """
     clean_name = (task_name or "").strip()
     if not clean_name:
-        return False, "Please provide a task title."
+        raise TaskValidationError("Please provide a task title.")
 
-    try:
-        active_tasks = fetch_active_tasks("Global")
-        if len(active_tasks) >= config.MAX_ACTIVE_TASKS:
-            return False, f"⚠️ Active task limit reached ({config.MAX_ACTIVE_TASKS} tasks). Please complete or delete existing tasks before adding a new one."
-
-        task_payload = TaskModel(
-            task_name=clean_name,
-            domain=domain,
-            status="Not started",
-            impact=impact,
-            urgency=urgency,
-            estimated_hours=estimated_hours,
-            someone_waiting=someone_waiting,
+    active_tasks = fetch_active_tasks("Global")
+    if len(active_tasks) >= config.MAX_ACTIVE_TASKS:
+        raise TaskLimitError(
+            f"Active task limit reached ({config.MAX_ACTIVE_TASKS} tasks). "
+            "Please complete or delete existing tasks before adding a new one."
         )
-        create_task(task_payload)
+
+    task_payload = TaskModel(
+        task_name=clean_name,
+        domain=domain,
+        status="Not started",
+        impact=impact,
+        urgency=urgency,
+        estimated_hours=estimated_hours,
+        someone_waiting=someone_waiting,
+    )
+    try:
+        page_id = create_task(task_payload)
+        task_payload.id = page_id
         fetch_active_tasks.clear()
-        return True, f"Task '{clean_name}' successfully added to Notion!"
+        return task_payload
     except Exception as e:
-        return False, f"Failed to create task in Notion: {str(e)}"
+        logger.exception("Unexpected error while creating task '%s' in Notion: %s", clean_name, str(e))
+        raise NotionServiceError(f"Failed to create task '{clean_name}' in Notion.") from e
 
 
+def validate_state_transition(current_status: TaskStatus, new_status: TaskStatus) -> bool:
+    """Validates whether transitioning from current_status to new_status is allowed."""
+    allowed = VALID_STATE_TRANSITIONS.get(current_status, set())
+    return new_status in allowed
 
-def update_task_status(page_id: str, new_status: TaskStatus, state_anchor: Optional[str] = None) -> None:
+
+def update_task_status(
+    page_id: str,
+    new_status: TaskStatus,
+    state_anchor: Optional[str] = None,
+    current_status: Optional[TaskStatus] = None,
+) -> None:
+    """
+    Updates the status and optional state anchor of a Notion task page,
+    enforcing VALID_STATE_TRANSITIONS rules before persisting.
+
+    Raises:
+        InvalidStateTransitionError: If the transition is illegal.
+        NotionServiceError: If the Notion update API call fails.
+    """
+    if current_status is None:
+        try:
+            page = execute_with_retry(lambda: notion.pages.retrieve(page_id=page_id))
+            status_prop = page.get("properties", {}).get("Status", {})
+            status_obj = status_prop.get("status") or status_prop.get("select") or {}
+            raw_status = status_obj.get("name") if isinstance(status_obj, dict) else None
+            current_status = raw_status if raw_status in VALID_STATUSES else "Not started"
+        except Exception as e:
+            logger.exception("Failed to retrieve task %s from Notion: %s", page_id, str(e))
+            raise NotionServiceError(f"Failed to retrieve task {page_id} from Notion.") from e
+
+    if not validate_state_transition(current_status, new_status):
+        allowed = VALID_STATE_TRANSITIONS.get(current_status, set())
+        raise InvalidStateTransitionError(
+            f"Invalid task state transition from '{current_status}' to '{new_status}'. "
+            f"Allowed transitions: {sorted(allowed)}"
+        )
+
     properties = {
         "Status": {"status": {"name": new_status}}
     }
@@ -263,12 +348,20 @@ def update_task_status(page_id: str, new_status: TaskStatus, state_anchor: Optio
             "rich_text": [{"text": {"content": state_anchor}}]
         }
 
-    execute_with_retry(lambda: notion.pages.update(page_id=page_id, properties=properties))
+    try:
+        execute_with_retry(lambda: notion.pages.update(page_id=page_id, properties=properties))
+    except Exception as e:
+        logger.exception("Failed to update status for task %s in Notion: %s", page_id, str(e))
+        raise NotionServiceError(f"Failed to update task status in Notion.") from e
 
 
 def delete_task(page_id: str) -> None:
     """Archive/delete a task page in Notion."""
-    execute_with_retry(lambda: notion.pages.update(page_id=page_id, archived=True))
+    try:
+        execute_with_retry(lambda: notion.pages.update(page_id=page_id, archived=True))
+    except Exception as e:
+        logger.exception("Failed to delete task %s in Notion: %s", page_id, str(e))
+        raise NotionServiceError(f"Failed to delete task in Notion.") from e
 
 
 TEMPLATE_MARKER_HEADING = "Execution Scope & Checklist"
@@ -318,6 +411,26 @@ def inject_template_blocks_if_empty(page_id: str) -> bool:
         return True
 
     return False
+
+
+def start_task(
+    page_id: str,
+    current_status: Optional[TaskStatus] = None,
+    inject_template: bool = True,
+) -> None:
+    """
+    Transitions a task to 'In progress' and conditionally injects execution template blocks.
+
+    Performance & Network Optimization:
+        If current_status is 'Paused', template block inspection is bypassed to eliminate
+        redundant Notion API network roundtrips, since paused tasks have already been
+        initialized with checklist content. For unstarted tasks, template block insertion
+        is conditionally executed if the page body is empty.
+    """
+    update_task_status(page_id, "In progress", current_status=current_status)
+    if current_status != "Paused" and inject_template:
+        inject_template_blocks_if_empty(page_id)
+
 
 @st.cache_data(ttl=60)
 def fetch_assets(domain_filter: Optional[str] = None, search_query: Optional[str] = None) -> List[AssetModel]:

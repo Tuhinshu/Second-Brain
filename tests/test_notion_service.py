@@ -11,13 +11,20 @@ from notion_service import (
     execute_with_retry,
     create_task,
     create_new_task,
+    start_task,
     update_task_status,
     delete_task,
     inject_template_blocks_if_empty,
     fetch_active_tasks,
     fetch_assets,
 )
-from Models import TaskModel
+from Models import (
+    InvalidStateTransitionError,
+    NotionServiceError,
+    TaskLimitError,
+    TaskModel,
+    TaskValidationError,
+)
 from notion_client.errors import APIResponseError
 import httpx
 
@@ -76,21 +83,20 @@ class TestNotionServiceMocked(unittest.TestCase):
         mock_fetch.return_value = []
         mock_create.return_value = "created-id"
 
-        success, msg = create_new_task(
+        task = create_new_task(
             task_name="New Feature",
             domain="Personal",
             impact=3,
             urgency=3,
             estimated_hours=1.0,
         )
-        self.assertTrue(success)
-        self.assertIn("successfully added", msg)
+        self.assertEqual(task.task_name, "New Feature")
+        self.assertEqual(task.id, "created-id")
 
     @patch("notion_service.fetch_active_tasks")
     def test_create_new_task_empty_title_rejected(self, mock_fetch):
-        success, msg = create_new_task(task_name="   ", domain="AIESEC")
-        self.assertFalse(success)
-        self.assertIn("provide a task title", msg)
+        with self.assertRaises(TaskValidationError):
+            create_new_task(task_name="   ", domain="AIESEC")
 
     @patch("notion_service.fetch_active_tasks")
     def test_create_new_task_advisory_limit(self, mock_fetch):
@@ -99,17 +105,33 @@ class TestNotionServiceMocked(unittest.TestCase):
             TaskModel(task_name=f"Task {i}", domain="Personal") for i in range(50)
         ]
 
-        success, msg = create_new_task(task_name="Task 51", domain="Personal")
-        self.assertFalse(success)
-        self.assertIn("Active task limit reached", msg)
+        with self.assertRaises(TaskLimitError):
+            create_new_task(task_name="Task 51", domain="Personal")
 
     @patch("notion_service.notion")
-    def test_update_task_status(self, mock_notion):
-        update_task_status("page-123", "In progress")
+    def test_update_task_status_valid_transition(self, mock_notion):
+        update_task_status("page-123", "In progress", current_status="Not started")
         mock_notion.pages.update.assert_called_with(
             page_id="page-123",
             properties={"Status": {"status": {"name": "In progress"}}},
         )
+
+    def test_update_task_status_invalid_transition_raises_error(self):
+        with self.assertRaises(InvalidStateTransitionError) as ctx:
+            update_task_status("page-123", "Paused", current_status="Backlog")
+        self.assertIn("Invalid task state transition", str(ctx.exception))
+
+    @patch("notion_service.notion")
+    def test_update_task_status_fetches_remote_when_current_omitted(self, mock_notion):
+        mock_notion.pages.retrieve.return_value = {
+            "id": "page-123",
+            "properties": {
+                "Status": {"status": {"name": "In progress"}}
+            }
+        }
+        update_task_status("page-123", "Paused")
+        mock_notion.pages.retrieve.assert_called_once()
+        mock_notion.pages.update.assert_called_once()
 
     @patch("notion_service.notion")
     def test_delete_task(self, mock_notion):
@@ -146,6 +168,20 @@ class TestNotionServiceMocked(unittest.TestCase):
         injected = inject_template_blocks_if_empty("existing-page")
         self.assertFalse(injected)
         mock_notion.blocks.children.append.assert_not_called()
+
+    @patch("notion_service.inject_template_blocks_if_empty")
+    @patch("notion_service.update_task_status")
+    def test_start_task_unstarted_triggers_template_injection(self, mock_update, mock_inject):
+        start_task("page-123", current_status="Not started")
+        mock_update.assert_called_once_with("page-123", "In progress", current_status="Not started")
+        mock_inject.assert_called_once_with("page-123")
+
+    @patch("notion_service.inject_template_blocks_if_empty")
+    @patch("notion_service.update_task_status")
+    def test_start_task_paused_skips_template_injection(self, mock_update, mock_inject):
+        start_task("page-123", current_status="Paused")
+        mock_update.assert_called_once_with("page-123", "In progress", current_status="Paused")
+        mock_inject.assert_not_called()
 
 
 if __name__ == "__main__":

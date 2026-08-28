@@ -1,117 +1,219 @@
-  Technical Architecture & Design Document
+# Technical Architecture & Design Document
 
- 1. System Overview
+## 1. System Overview
 
-The *Second Brain Execution Engine* is a highperformance productivity cockpit built to eliminate cognitive friction and decision fatigue. Unlike standard todo applications that merely list items, this system acts as an algorithmic triage system that pulls active tasks from Notion, prioritizes them via a weighted scoring formula, and surfaces a laserfocused top3 execution queue.
+The **Second Brain Execution Engine** is a high-performance productivity cockpit built to eliminate cognitive friction and decision fatigue. Unlike standard todo applications that merely list items, this system acts as an algorithmic triage engine that pulls active tasks from Notion, prioritizes them via a multi-factor scoring formula, and surfaces a laser-focused top-3 execution queue.
 
-mermaid
+```mermaid
 graph TD
-    User([User / Browser]) <> UI[Streamlit Frontend App<br>app.py]
-    UI <> Logic[Scoring & Ranking Engine<br>scoring_engine.py]
-    UI <> Service[Notion Service Layer<br>notion_service.py]
-    Logic <> Models[Pydantic Models<br>Models.py]
-    Service <> Models
-    Service <> Config[Config Loader<br>config.py]
-    Config <> Env[Environment .env]
-    Service <> NotionAPI[(Notion REST API v2)]
+    User([User / Browser]) <--> UI[Streamlit Frontend App<br>app.py]
+    UI <--> Logic[Scoring & Ranking Engine<br>scoring_engine.py]
+    UI <--> Service[Notion Service Layer<br>notion_service.py]
+    
+    subgraph Exception & Validation Layer
+        Models[Pydantic Models & Exceptions<br>Models.py]
+        Config[Config Validator<br>config.py]
+    end
+    
+    Service <--> Models
+    Logic <--> Models
+    Service <--> Config
+    
+    subgraph Resilience Layer
+        Retry[Retry Wrapper & Exponential Backoff<br>execute_with_retry]
+    end
+    
+    Service <--> Retry
+    Retry <--> NotionAPI[(Notion REST API v2)]
     
     subgraph Notion Workspace
         TasksDB[(Tasks Database)]
         AssetsDB[(Asset Vault Database)]
     end
     
-    NotionAPI <> TasksDB
-    NotionAPI <> AssetsDB
+    NotionAPI <--> TasksDB
+    NotionAPI <--> AssetsDB
+```
 
+---
 
+## 2. Core Architectural Components
 
+### 2.1 Presentation & State Management Layer (`app.py`)
+- **Framework**: Streamlit (wide layout, responsive containers).
+- **Custom UI System**: Vanilla CSS injecting warm amber themes (`#B45309`), custom hero headers with base64-encoded background imagery, button state micro-transitions, and dialog modals.
+- **Session State**: Manages `active_page`, `active_domain`, and `pause_prompt_id` dynamically across hot-reloads and reruns.
+- **Modal Dialogs**: Uses Streamlit `@st.dialog` for non-disruptive task capture and destructive deletion confirmations without losing focus.
+- **Defensive Rendering**: Escapes dynamic Notion strings (`escape_markdown`) to prevent formatting breaks or prompt injections.
 
- 2. Core Architectural Components
+### 2.2 Domain, Data Validation & Exception Layer (`Models.py`)
+- Built on **Pydantic v2** (`BaseModel`, `Field`, `Literal`).
+- Ensures runtime validation, strict bounds on numerical inputs ($1 \le \text{impact} \le 5$, $0.25 \le \text{estimated\_hours} \le 12.0$), and standardized types across Notion API serialization/deserialization.
+- **`TaskModel`**: Encapsulates task attributes, status, domain, impact, urgency, blockers, state anchor notes, and computed priority scores.
+- **`AssetModel`**: Encapsulates reusable knowledge items, tags (`Field(default_factory=list)`), URLs, and categorical domains.
+- **Typed Custom Exceptions**:
+  - `SecondBrainError`: Base application exception.
+  - `TaskValidationError`: Raised for missing/malformed task inputs.
+  - `TaskLimitError`: Raised when the advisory task limit is reached.
+  - `InvalidStateTransitionError`: Raised when an illegal state change is requested.
+  - `NotionServiceError`: Raised when an external Notion API operation fails.
 
- 2.1 Presentation & State Management Layer (app.py)
- *Framework*: Streamlit (wide layout, responsive containers).
- *Custom UI System*: Vanilla CSS injecting tailored amber/slate themes (B45309), custom hero headers with base64 encoded background imagery, button state microtransitions, and dialog modals.
- *Session State*: Manages active_page, active_domain, and pause_prompt_id dynamically across hotreloads and reruns.
- *Modal Dialogs*: Uses Streamlit @st.dialog for nondisruptive task capture without losing context.
+### 2.3 Task Lifecycle & State Transition Engine
+Task status transitions are strictly governed by `VALID_STATE_TRANSITIONS`. Status changes are validated both in the service layer before writing to Notion and mapped to UI indicators.
 
- 2.2 Domain & Data Validation Layer (Models.py)
- Built on *Pydantic v2* (BaseModel, Field, Literal).
- Ensures runtime validation, strict bounds on numerical inputs (e.g. 1 <= impact <= 5, 0.25 <= estimated_hours <= 12.0), and standardized types across Notion API serialization/deserialization.
- *TaskModel*: Encapsulates task attributes, status, domain, impact, urgency, blockers, state anchor notes, and computed priority scores.
- *AssetModel*: Encapsulates reusable knowledge items, tags, URLs, and categorical domains.
+```mermaid
+stateDiagram-v2
+    [*] --> Backlog: Create as Backlog
+    [*] --> NotStarted: Create as Not Started
+    
+    Backlog --> NotStarted: Promote
+    Backlog --> InProgress: Start Directly
+    Backlog --> Done: Complete
+    
+    NotStarted --> InProgress: Start
+    NotStarted --> Backlog: Demote
+    NotStarted --> Done: Complete
+    
+    InProgress --> Paused: Pause (State Anchor)
+    InProgress --> Done: Complete
+    InProgress --> NotStarted: Reset
+    
+    Paused --> InProgress: Resume
+    Paused --> Done: Complete
+    Paused --> NotStarted: Reset
+    
+    Done --> NotStarted: Reopen
+    Done --> Backlog: Move to Backlog
+    Done --> InProgress: Restart
+```
 
- 2.3 Algorithmic Scoring Engine (scoring_engine.py)
- Pure, sideeffectfree functional module.
- Calculates an objective *Priority Score* for each task using multifactor weighted parameters:
-  
+#### Valid State Transition Matrix
+| Current State | Allowed Next States |
+|---|---|
+| **Not started** | `In progress`, `Backlog`, `Done` |
+| **In progress** | `Paused`, `Done`, `Not started` |
+| **Paused** | `In progress`, `Done`, `Not started` |
+| **Backlog** | `Not started`, `Done`, `In progress` |
+| **Done** | `Not started`, `Backlog`, `In progress` |
+
+### 2.4 Algorithmic Scoring Engine (`scoring_engine.py`)
+- Pure, side-effect-free functional module.
+- Calculates an objective **Priority Score** for each task using multi-factor weighted parameters:
+
 $$\text{Priority Score} = (\text{Impact} \times 2.0) + \text{Urgency} + \text{Blocker Bonus} + (\text{Estimated Hours} \times 1.5)$$
 
 Where:
- $\text{Blocker Bonus} = 5.0$ if $\text{Someone Waiting?} = \text{True}$, else $0.0$.
- *Sorting Rule*: Tasks with status In progress are always pinned to the top of the queue. Remaining tasks are sorted descending by priority_score.
+- $\text{Blocker Bonus} = 5.0$ if $\text{Someone Waiting?} = \text{True}$, else $0.0$.
+- **Sorting Rule**: Tasks with status `In progress` are always pinned to the top of the queue. Remaining tasks are sorted descending by `priority_score`.
 
- 2.4 Notion Integration Service Layer (notion_service.py)
- Implements the adapter pattern over the official notionclient SDK.
- Translates Notion's nested property structures (Title, Select, Status, Number, Checkbox, Rich Text) into stronglytyped Pydantic models and viceversa.
- *Dynamic Block Injection*: Automatically generates and appends default execution scope checklists (Execution Scope & Checklist) into newly started Notion task pages when body blocks are empty.
- *Domainbased Filtering*: Generates structured compound query payloads to filter tasks by lifecycle state and operational domain.
+### 2.5 Notion Integration & Resilience Layer (`notion_service.py`)
+- Implements the adapter pattern over the official `notion-client` SDK.
+- Translates Notion's nested property structures (`Title`, `Select`, `Status`, `Number`, `Checkbox`, `Rich Text`) into strongly-typed Pydantic models with defensive property extractors (`_parse_int_prop`, `_parse_float_prop`, `_extract_plain_text`).
+- **Transient Fault Tolerance (`execute_with_retry`)**:
+  - Automatically handles HTTP `429` (Rate Limited), `500`, `502`, `503`, `504` status codes and request timeouts.
+  - Applies bounded exponential backoff with randomized jitter:
+    $$\text{Delay} = \min(\text{base\_delay} \times 2^{\text{attempt}-1} + \text{jitter}, \text{max\_delay})$$
+- **Performance-Optimized Startup (`start_task`)**:
+  - Resuming `"Paused"` tasks skips template inspection queries, avoiding unnecessary network latency.
+  - Initial startup for `"Not started"` tasks checks `TEMPLATE_MARKER_HEADING` to idempotently inject execution checklists without creating duplicate blocks.
 
+---
 
+## 3. Data Flow & Execution Pipeline
 
- 3. Data Flow & Execution Pipeline
-
-mermaid
+```mermaid
 sequenceDiagram
     autonumber
     actor User
     participant App as Streamlit UI (app.py)
     participant Engine as Scoring Engine
     participant Notion as Notion Service
+    participant Retry as Retry Wrapper
     participant API as Notion API
 
     User>>App: Opens Dashboard / Selects Domain Filter
     App>>Notion: fetch_active_tasks(domain)
-    Notion>>API: databases.query(filter: status != 'Done')
-    API>>Notion: Raw JSON Pages
+    Notion>>Retry: execute_with_retry(databases.query)
+    Retry>>API: POST /v1/databases/{id}/query
+    API>>Retry: 200 OK Raw JSON Pages
+    Retry>>Notion: Filtered Results
     Notion>>App: List[TaskModel]
     App>>Engine: rank_tasks(tasks)
     Engine>>App: Sorted & Pinned Task Queue
     App>>User: Renders Top 3 Arena + Backlog Drawer
 
-    opt User clicks "Start Task"
+    opt User clicks "Start Task" (Unstarted)
         User>>App: Click 'Start'
-        App>>Notion: update_task_status(id, 'In progress')
-        App>>Notion: inject_template_blocks_if_empty(id)
-        Notion>>API: pages.update() & blocks.children.append()
-        App>>User: Refresh with task pinned in focus
+        App>>Notion: start_task(id, current_status='Not started')
+        Notion>>Retry: update_task_status + inject_template_blocks_if_empty
+        Retry>>API: PATCH /v1/pages/{id} & POST /v1/blocks/{id}/children
+        App>>User: Refreshes with task pinned in focus & checklist initialized
+    end
+
+    opt User clicks "Resume Task" (Paused)
+        User>>App: Click 'Resume'
+        App>>Notion: start_task(id, current_status='Paused')
+        Note over Notion: Skips block inspection roundtrip
+        Notion>>Retry: update_task_status(id, 'In progress')
+        Retry>>API: PATCH /v1/pages/{id}
+        App>>User: Refreshes with task resumed immediately
     end
 
     opt User clicks "Pause Task" (State Anchor Protocol)
         User>>App: Click 'Pause'
         App>>User: Display State Anchor Prompt
         User>>App: Inputs next physical action note & submits
-        App>>Notion: update_task_status(id, 'Not started', state_anchor)
-        Notion>>API: pages.update()
+        App>>Notion: update_task_status(id, 'Paused', state_anchor)
+        Notion>>Retry: execute_with_retry(pages.update)
+        Retry>>API: PATCH /v1/pages/{id}
         App>>User: Task paused with state anchor preserved
     end
+```
 
+---
 
-
-
- 4. The State Anchor Protocol
+## 4. The State Anchor Protocol
 
 Cognitive science shows that task interruption causes severe attention residue. When returning to a paused task, users waste significant energy figuring out where they left off.
 
-The *State Anchor Protocol* solves this:
-1. When a user clicks *Pause*, the application intercepts the action.
-2. It prompts: *"What is the exact next 15minute physical action to take when resuming?"*
-3. The answer is committed directly to the Notion page's State Anchor property.
+The **State Anchor Protocol** solves this:
+1. When a user clicks **Pause**, the application intercepts the action.
+2. It prompts: *"What is the exact next 15-minute physical action to take when resuming?"*
+3. The answer is committed directly to the Notion page's `State Anchor` property alongside the `"Paused"` status.
 4. When the task appears again in the Execution Arena, the anchor note is prominently surfaced in an information badge.
 
+---
 
+## 5. Concurrency Model & Capacity Guardrails
 
- 5. Security & Deployment Architecture
+### 5.1 Advisory Task Capacity Limit (`MAX_ACTIVE_TASKS`)
+- **Limitation**: The Notion REST API is a remote service without distributed transactional table locks across isolated client sessions.
+- **Design Choice**: `MAX_ACTIVE_TASKS` (default: 50, configurable from 1 to 500) is enforced as an **advisory application-level guardrail** in `create_new_task()` to prevent cognitive queue saturation.
+- **Robust Configuration**: `config._parse_max_active_tasks` validates environment inputs on startup, rejecting non-integers or out-of-bounds numbers with actionable error messages.
 
- *Zero Hardcoded Secrets*: Secrets are loaded through standard .env configuration using dotenv.
- *Database Decoupling*: Database schema alterations in Notion are isolated to the parser functions in notion_service.py.
- *Stateless Execution*: The application holds no persistent local database; Notion acts as the authoritative source of truth.
+### 5.2 Server-Side Logging & Client Error Sanitization
+- All unexpected errors and external API failures are logged server-side via Python's standard `logging` library (`logger.exception()`) with full stack traces.
+- Presentation layers in `app.py` expose sanitized, user-friendly feedback to prevent leaking sensitive API tokens, database IDs, or internal network topology.
+
+---
+
+## 6. CI/CD Quality Gates & Security Infrastructure
+
+The project includes an automated Continuous Integration pipeline ([`.github/workflows/ci.yml`](file:///d:/Second-Brain/.github/workflows/ci.yml)) executed on every push and pull request:
+
+```mermaid
+graph LR
+    Push[Git Push / PR] --> Compile[Python Bytecode Compilation<br>py_compile]
+    Compile --> TestSuite[Automated Test Suite<br>38 Unit & Mocked Integration Tests]
+    TestSuite --> SecurityScan[Secret Scanning Gate<br>Gitleaks Analyzer]
+    SecurityScan --> Deploy[Ready for Deployment]
+```
+
+1. **Bytecode Compilation**: Validates syntax across all source files via `python -m py_compile`.
+2. **Automated Test Suite**: Executes 38 comprehensive unit and integration tests across:
+   - `test_models.py`: Data models, bounds validation, and state machine transitions.
+   - `test_scoring_engine.py`: Multi-factor priority calculations and pinning rules.
+   - `test_notion_parsing.py`: Defensive Notion JSON property extractors and markdown escaping.
+   - `test_notion_service.py`: Retry wrappers, API error recovery, idempotency, and status updates.
+   - `test_config.py`: Environment configuration bounds and error handling.
+3. **Automated Secret Scanning**: Runs `gitleaks` across the commit history to enforce zero-secret commitments.

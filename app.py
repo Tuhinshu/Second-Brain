@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import re
 from typing import Callable, Optional
@@ -6,17 +7,24 @@ from typing import Callable, Optional
 import streamlit as st
 
 import config
-from Models import TaskModel
+from Models import (
+    InvalidStateTransitionError,
+    NotionServiceError,
+    TaskLimitError,
+    TaskModel,
+    TaskValidationError,
+)
 from notion_service import (
     create_new_task,
     delete_task,
     fetch_active_tasks,
     fetch_assets,
-    inject_template_blocks_if_empty,
+    start_task,
     update_task_status,
 )
 from scoring_engine import rank_tasks
 
+logger = logging.getLogger("second_brain.app")
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -39,8 +47,18 @@ def run_notion_action(
         if success_msg:
             st.toast(success_msg)
         st.rerun()
+    except (TaskValidationError, InvalidStateTransitionError) as e:
+        logger.warning("%s validation error: %s", error_prefix, str(e))
+        st.warning(f"{error_prefix}: {str(e)}")
+    except TaskLimitError as e:
+        logger.warning("%s task limit error: %s", error_prefix, str(e))
+        st.warning(f"⚠️ {str(e)}")
+    except NotionServiceError as e:
+        logger.error("%s Notion service error: %s", error_prefix, str(e))
+        st.error(f"{error_prefix}. Please check your connection or try again.")
     except Exception as e:
-        st.error(f"{error_prefix}: {str(e)}")
+        logger.exception("%s unexpected error: %s", error_prefix, str(e))
+        st.error(f"{error_prefix}. Please check your connection or try again.")
 
 
 @st.cache_data
@@ -183,21 +201,26 @@ def render_add_task_form(key_suffix: str = "") -> None:
         )
 
         if submitted:
-            success, message = create_new_task(
-                task_name=new_task_name,
-                domain=new_domain,
-                impact=new_impact,
-                urgency=new_urgency,
-                estimated_hours=new_hours,
-                someone_waiting=new_waiting,
-            )
-            if success:
-                st.success(message)
+            try:
+                task = create_new_task(
+                    task_name=new_task_name,
+                    domain=new_domain,
+                    impact=new_impact,
+                    urgency=new_urgency,
+                    estimated_hours=new_hours,
+                    someone_waiting=new_waiting,
+                )
+                st.success(f"Task '{task.task_name}' successfully added to Notion!")
                 st.rerun()
-            elif "Failed to create" in message:
-                st.error(message)
-            else:
-                st.warning(message)
+            except TaskValidationError as e:
+                st.warning(str(e))
+            except TaskLimitError as e:
+                st.warning(f"⚠️ {str(e)}")
+            except NotionServiceError:
+                st.error("Failed to create task in Notion. Please check your connection or try again.")
+            except Exception as e:
+                logger.exception("Unexpected error creating task: %s", str(e))
+                st.error("An unexpected error occurred while adding the task.")
 
 
 @st.dialog("Quick Task Capture")
@@ -284,6 +307,7 @@ def render_state_anchor_modal() -> None:
                         st.session_state.pause_prompt_id,
                         "Paused",
                         state_anchor=anchor_text.strip(),
+                        current_status="In progress",
                     )
                     st.session_state.pause_prompt_id = None
 
@@ -305,7 +329,8 @@ def render_execution_arena() -> None:
         raw_tasks = fetch_active_tasks(st.session_state.active_domain)
         ranked_tasks = rank_tasks(raw_tasks)
     except Exception as e:
-        st.error(f"Error fetching tasks from Notion: {str(e)}")
+        logger.exception("Error fetching active tasks from Notion: %s", str(e))
+        st.error("Error fetching tasks from Notion. Please check your connection or try again.")
         ranked_tasks = []
 
     if not ranked_tasks:
@@ -348,9 +373,8 @@ def render_execution_arena() -> None:
                     if col_b1.button(
                         btn_label, key=f"start_{task.id}", use_container_width=True
                     ):
-                        def _start_action(t_id=task.id):
-                            update_task_status(t_id, "In progress")
-                            inject_template_blocks_if_empty(t_id)
+                        def _start_action(t_id=task.id, t_status=task.status):
+                            start_task(t_id, current_status=t_status)
 
                         run_notion_action(
                             _start_action,
@@ -371,7 +395,9 @@ def render_execution_arena() -> None:
                     type="primary" if is_active else "secondary",
                 ):
                     run_notion_action(
-                        lambda t_id=task.id: update_task_status(t_id, "Done"),
+                        lambda t_id=task.id, t_status=task.status: update_task_status(
+                            t_id, "Done", current_status=t_status
+                        ),
                         f"Completed: {task.task_name}",
                         "Failed to complete task",
                     )
@@ -396,7 +422,9 @@ def render_execution_arena() -> None:
                         "Promote", key=f"promote_{b_task.id}", use_container_width=True
                     ):
                         run_notion_action(
-                            lambda bt_id=b_task.id: update_task_status(bt_id, "Not started"),
+                            lambda bt_id=b_task.id, bt_status=b_task.status: update_task_status(
+                                bt_id, "Not started", current_status=bt_status
+                            ),
                             f"Promoted {b_task.task_name} to active queue!",
                             "Failed to promote task",
                         )
@@ -439,7 +467,8 @@ def render_asset_vault() -> None:
                         else:
                             st.caption("No URL attached")
     except Exception as e:
-        st.error(f"Error querying Asset Vault: {str(e)}")
+        logger.exception("Error querying Asset Vault from Notion: %s", str(e))
+        st.error("Error querying Asset Vault. Please check your connection or try again.")
 
 
 def render_quick_task_page() -> None:

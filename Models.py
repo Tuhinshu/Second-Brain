@@ -4,6 +4,28 @@ from typing import Optional, Literal
 TaskStatus = Literal["Backlog", "Not started", "In progress", "Paused", "Done"]
 TaskDomain = Literal["AIESEC", "Academics", "Clients", "Personal"]
 
+# --- Custom Exception Hierarchy ---
+class SecondBrainError(Exception):
+    """Base exception for Second Brain application errors."""
+    pass
+
+class NotionServiceError(SecondBrainError):
+    """Raised when an external Notion API operation fails."""
+    pass
+
+class TaskValidationError(SecondBrainError):
+    """Raised when task data fails domain or validation rules."""
+    pass
+
+class TaskLimitError(SecondBrainError):
+    """Raised when the active task limit has been reached."""
+    pass
+
+class InvalidStateTransitionError(SecondBrainError):
+    """Raised when an illegal task state transition is attempted."""
+    pass
+
+
 VALID_STATE_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     "Not started": {"In progress", "Backlog", "Done"},
     "In progress": {"Paused", "Done", "Not started"},
@@ -30,4 +52,4 @@ class AssetModel(BaseModel):
     type: str = "Docs"
     domain: str = "all"
     url: Optional[str] = None
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)

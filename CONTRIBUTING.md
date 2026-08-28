@@ -35,7 +35,11 @@ Please maintain a welcoming, inclusive, and professional environment for everyon
 
 4. **Install dependencies**:
    ```bash
+   # Standard installation:
    pip install -r requirements.txt
+
+   # Deterministic production lockfile installation:
+   pip install -r requirements-lock.txt
    ```
 
 5. **Set up environment variables**:
@@ -72,22 +76,31 @@ Please maintain a welcoming, inclusive, and professional environment for everyon
    - **Never commit `.env` or sensitive API keys.**
 
 3. **Code Quality & Verification**:
-   Before submitting your changes, verify compilation and test locally:
+   Before submitting your changes, run compilation and the automated test suite:
    ```bash
-   # 1. Verify Python syntax and compilation
+   # 1. Verify Python syntax and bytecode compilation
    python -m py_compile app.py config.py notion_service.py Models.py scoring_engine.py
 
-   # 2. Run the Streamlit development server
+   # 2. Run the automated test suite (38 unit & integration tests)
+   python -m unittest discover tests -v
+
+   # 3. Test locally in the browser
    streamlit run app.py
    ```
 
-4. **Commit your changes with clear semantic messages**:
+4. **Controlled Dependency Upgrades**:
+   To update or add dependencies deliberately:
+   - Modify the pinned version in `requirements.txt`.
+   - Verify the test suite passes: `python -m unittest discover tests -v`.
+   - Update `requirements-lock.txt` to lock all transitive dependencies.
+
+5. **Commit your changes with clear semantic messages**:
    ```bash
    git add .
    git commit -m "feat: add domain color coding to task cards"
    ```
 
-5. **Push to your fork and submit a Pull Request**:
+6. **Push to your fork and submit a Pull Request**:
    ```bash
    git push origin feature/your-feature-name
    ```
