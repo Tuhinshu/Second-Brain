@@ -1,4 +1,4 @@
-﻿import os
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,3 +11,5 @@ if not NOTION_API_KEY:
     raise ValueError("CRITICAL: NOTION_API_KEY is not set in .env")
 if not NOTION_TASKS_DB_ID:
     raise ValueError("CRITICAL: NOTION_TASKS_DB_ID is not set in .env")
+
+MAX_ACTIVE_TASKS = int(os.getenv("MAX_ACTIVE_TASKS", "50"))

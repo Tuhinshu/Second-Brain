@@ -1,8 +1,9 @@
 from typing import List, Optional
 from datetime import datetime
+import streamlit as st
 from notion_client import Client
 import config
-from Models import TaskModel, AssetModel
+from Models import TaskModel, AssetModel, TaskStatus
 
 notion = Client(auth=config.NOTION_API_KEY)
 
@@ -64,6 +65,7 @@ def parse_asset_page(page: dict) -> AssetModel:
         tags=tags
     )
 
+@st.cache_data(ttl=60)
 def fetch_active_tasks(domain_filter: Optional[str] = None) -> List[TaskModel]:
     filter_conditions = [
         {"property": "Status", "status": {"does_not_equal": "Done"}}
@@ -84,6 +86,13 @@ def fetch_active_tasks(domain_filter: Optional[str] = None) -> List[TaskModel]:
 
 
 def create_task(task: TaskModel) -> str:
+    active_tasks = fetch_active_tasks("Global")
+    if len(active_tasks) >= config.MAX_ACTIVE_TASKS:
+        raise ValueError(
+            f"Active task limit reached ({config.MAX_ACTIVE_TASKS} tasks). "
+            "Please complete or delete existing tasks before adding new ones."
+        )
+
     properties = {
         "Task Name": {"title": [{"text": {"content": task.task_name}}]},
         "Status": {"status": {"name": task.status}},
@@ -106,7 +115,7 @@ def create_task(task: TaskModel) -> str:
     return response["id"]
 
 
-def update_task_status(page_id: str, new_status: str, state_anchor: Optional[str] = None) -> None:
+def update_task_status(page_id: str, new_status: TaskStatus, state_anchor: Optional[str] = None) -> None:
     properties = {
         "Status": {"status": {"name": new_status}}
     }
@@ -152,6 +161,7 @@ def inject_template_blocks_if_empty(page_id: str) -> None:
         ]
         notion.blocks.children.append(block_id=page_id, children=default_blocks)
 
+@st.cache_data(ttl=60)
 def fetch_assets(domain_filter: Optional[str] = None, search_query: Optional[str] = None) -> List[AssetModel]:
     if not config.NOTION_ASSETS_DB_ID:
         return []

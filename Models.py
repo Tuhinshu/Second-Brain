@@ -2,11 +2,14 @@ from pydantic import BaseModel, Field
 from typing import Optional, Literal
 from datetime import datetime
 
+TaskStatus = Literal["Backlog", "Not started", "In progress", "Paused", "Done"]
+TaskDomain = Literal["AIESEC", "Academics", "Clients", "Personal"]
+
 class TaskModel(BaseModel):
     id: Optional[str] = None
     task_name: str = Field(..., min_length=1)
-    status: Literal["Backlog", "Not started", "In progress", "Paused", "Done"] = "Not started"
-    domain: Literal["AIESEC", "Academics", "Clients", "Personal"]
+    status: TaskStatus = "Not started"
+    domain: TaskDomain
     impact: int = Field(default=3, ge=1, le=5)
     urgency: int = Field(default=3, ge=1, le=5)
     estimated_hours: float = Field(default=1.0, ge=0.25, le=12.0)

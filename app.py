@@ -1,6 +1,9 @@
 import streamlit as st
 import base64
-from datetime import datetime
+import os
+import re
+from typing import Optional, Callable
+import config
 from Models import TaskModel
 from scoring_engine import rank_tasks
 from notion_service import (
@@ -11,6 +14,33 @@ from notion_service import (
     inject_template_blocks_if_empty,
     fetch_assets,
 )
+
+def escape_markdown(text: str) -> str:
+    """Escapes Markdown metacharacters in external text to prevent injection or formatting breaks."""
+    if not text:
+        return ""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|~<>])", r"\\\1", str(text))
+
+
+def run_notion_action(
+    action_fn: Callable[[], None],
+    success_msg: Optional[str] = None,
+    error_prefix: str = "Operation failed"
+) -> bool:
+    """Unified handler for executing Notion API mutations with error handling, cache clearing, and UI updates."""
+    try:
+        action_fn()
+        fetch_active_tasks.clear()
+        if success_msg:
+            st.toast(success_msg)
+        st.rerun()
+        return True
+    except Exception as e:
+        st.error(f"{error_prefix}: {str(e)}")
+        return False
+
+
+
 
 st.set_page_config(
     page_title="Second Brain Execution Engine",
@@ -47,19 +77,27 @@ def render_add_task_form(key_suffix=""):
             if not new_task_name.strip():
                 st.warning("Please provide a task title.")
             else:
-                task_payload = TaskModel(
-                    task_name=new_task_name.strip(),
-                    domain=new_domain,
-                    status="Not started",
-                    impact=new_impact,
-                    urgency=new_urgency,
-                    estimated_hours=new_hours,
-                    someone_waiting=new_waiting
-                )
                 try:
-                    create_task(task_payload)
-                    st.success(f"Task '{new_task_name}' successfully added to Notion!")
-                    st.rerun()
+                    active_tasks = fetch_active_tasks("Global")
+                    if len(active_tasks) >= config.MAX_ACTIVE_TASKS:
+                        st.warning(
+                            f"⚠️ Active task limit reached ({config.MAX_ACTIVE_TASKS} tasks). "
+                            "Please complete or delete existing tasks before adding a new one."
+                        )
+                    else:
+                        task_payload = TaskModel(
+                            task_name=new_task_name.strip(),
+                            domain=new_domain,
+                            status="Not started",
+                            impact=new_impact,
+                            urgency=new_urgency,
+                            estimated_hours=new_hours,
+                            someone_waiting=new_waiting
+                        )
+                        create_task(task_payload)
+                        fetch_active_tasks.clear()
+                        st.success(f"Task '{new_task_name}' successfully added to Notion!")
+                        st.rerun()
                 except Exception as e:
                     st.error(f"Failed to create task in Notion: {str(e)}")
 
@@ -68,14 +106,14 @@ def add_task_dialog():
     render_add_task_form(key_suffix="_dialog")
 
 
-import os
-
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def get_base64_of_bin_file(bin_file):
+@st.cache_data
+def get_base64_of_bin_file(bin_file: str) -> str:
     with open(bin_file, 'rb') as f:
         data = f.read()
     return base64.b64encode(data).decode()
+
 
 try:
     img_b64 = get_base64_of_bin_file(os.path.join(CURRENT_DIR, "Cover.jpg"))
@@ -255,10 +293,10 @@ if st.session_state.active_page == "24-Hour Execution Arena":
                 c1, c2 = st.columns([1, 4])
                 if c1.button("Save & Pause", type="primary"):
                     if anchor_text.strip():
-                        update_task_status(st.session_state.pause_prompt_id, "Not started", state_anchor=anchor_text.strip())
-                        st.session_state.pause_prompt_id = None
-                        st.toast("State anchor recorded & task paused!")
-                        st.rerun()
+                        def _pause_action():
+                            update_task_status(st.session_state.pause_prompt_id, "Not started", state_anchor=anchor_text.strip())
+                            st.session_state.pause_prompt_id = None
+                        run_notion_action(_pause_action, "State anchor recorded & task paused!", "Failed to pause task")
                     else:
                         st.warning("Please provide a brief anchor note before pausing.")
                 if c2.button("Cancel"):
@@ -275,42 +313,43 @@ if st.session_state.active_page == "24-Hour Execution Arena":
 
                 with c_info:
                     status_badge = f"**[{task.status.upper()}]**" if is_active else f"[{task.status}]"
-                    st.markdown(f"### {idx + 1}. {task.task_name}")
+                    st.markdown(f"### {idx + 1}. {escape_markdown(task.task_name)}")
                     st.markdown(
-                        f"{status_badge} `{task.domain}` | "
+                        f"{status_badge} `{escape_markdown(task.domain)}` | "
                         f"**Score:** `{task.priority_score}` | "
                         f"**Est:** `{task.estimated_hours}h` | "
                         f"**Blocker:** `{'YES' if task.someone_waiting else 'NO'}`"
                     )
                     if task.state_anchor:
-                        st.info(f"State Anchor: {task.state_anchor}")
+                        st.info(f"State Anchor: {escape_markdown(task.state_anchor)}")
 
                 with c_actions:
                     st.write("")
                     col_b1, col_b2, col_b3 = st.columns([1.1, 1.2, 0.9])
                     if task.status != "In progress":
                         if col_b1.button("Start", key=f"start_{task.id}", use_container_width=True):
-                            update_task_status(task.id, "In progress")
-                            inject_template_blocks_if_empty(task.id)
-                            st.toast(f"Started: {task.task_name}")
-                            st.rerun()
+                            def _start_action(t_id=task.id):
+                                update_task_status(t_id, "In progress")
+                                inject_template_blocks_if_empty(t_id)
+                            run_notion_action(_start_action, f"Started: {task.task_name}", "Failed to start task")
                     else:
                         if col_b1.button("Pause", key=f"pause_{task.id}", use_container_width=True):
                             st.session_state.pause_prompt_id = task.id
                             st.rerun()
 
                     if col_b2.button("Complete", key=f"done_{task.id}", use_container_width=True, type="primary" if is_active else "secondary"):
-                        update_task_status(task.id, "Done")
-                        st.toast(f"Completed: {task.task_name}")
-                        st.rerun()
+                        run_notion_action(
+                            lambda t_id=task.id: update_task_status(t_id, "Done"),
+                            f"Completed: {task.task_name}",
+                            "Failed to complete task"
+                        )
 
                     if col_b3.button("🗑️ Delete", key=f"del_{task.id}", use_container_width=True):
-                        try:
-                            delete_task(task.id)
-                            st.toast(f"Deleted: {task.task_name}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Failed to delete task: {str(e)}")
+                        run_notion_action(
+                            lambda t_id=task.id: delete_task(t_id),
+                            f"Deleted: {task.task_name}",
+                            "Failed to delete task"
+                        )
 
         if backlog_tasks:
             st.write("")
@@ -319,22 +358,23 @@ if st.session_state.active_page == "24-Hour Execution Arena":
                     b_col1, b_col2, b_col3 = st.columns([4, 1.2, 0.9])
                     with b_col1:
                         st.markdown(
-                            f"• **{b_task.task_name}** (`{b_task.domain}`) — "
+                            f"• **{escape_markdown(b_task.task_name)}** (`{escape_markdown(b_task.domain)}`) — "
                             f"Score: `{b_task.priority_score}` | Est: `{b_task.estimated_hours}h`"
                         )
                     with b_col2:
                         if st.button("Promote", key=f"promote_{b_task.id}", use_container_width=True):
-                            update_task_status(b_task.id, "Not started")
-                            st.toast(f"Promoted {b_task.task_name} to active queue!")
-                            st.rerun()
+                            run_notion_action(
+                                lambda bt_id=b_task.id: update_task_status(bt_id, "Not started"),
+                                f"Promoted {b_task.task_name} to active queue!",
+                                "Failed to promote task"
+                            )
                     with b_col3:
                         if st.button("🗑️ Delete", key=f"del_{b_task.id}", use_container_width=True):
-                            try:
-                                delete_task(b_task.id)
-                                st.toast(f"Deleted: {b_task.task_name}")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Failed to delete task: {str(e)}")
+                            run_notion_action(
+                                lambda bt_id=b_task.id: delete_task(bt_id),
+                                f"Deleted: {b_task.task_name}",
+                                "Failed to delete task"
+                            )
 
 elif st.session_state.active_page == "Reusable Asset Vault":
     st.subheader("Resources")
@@ -350,9 +390,10 @@ elif st.session_state.active_page == "Reusable Asset Vault":
                 with st.container(border=True):
                     a_info, a_link = st.columns([4, 1])
                     with a_info:
-                        st.markdown(f"{asset.title}  `{asset.type}` `{asset.domain}`")
+                        st.markdown(f"**{escape_markdown(asset.title)}**  `{escape_markdown(asset.type)}` `{escape_markdown(asset.domain)}`")
                         if asset.tags:
-                            st.caption(f"Tags: {', '.join(asset.tags)}")
+                            escaped_tags = ", ".join(escape_markdown(t) for t in asset.tags)
+                            st.caption(f"Tags: {escaped_tags}")
                     with a_link:
                         if asset.url:
                             st.link_button("Open Resources", asset.url, use_container_width=True)
