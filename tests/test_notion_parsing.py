@@ -1,19 +1,19 @@
-import unittest
 import os
+import unittest
 
 # Set dummy environment variables for configuration loading before import
 os.environ["NOTION_API_KEY"] = "dummy_key"
 os.environ["NOTION_TASKS_DB_ID"] = "dummy_tasks_db"
 os.environ["NOTION_ASSETS_DB_ID"] = "dummy_assets_db"
 
+from app import escape_markdown
 from notion_service import (
     _extract_plain_text,
-    _parse_int_prop,
     _parse_float_prop,
-    parse_task_page,
+    _parse_int_prop,
     parse_asset_page,
+    parse_task_page,
 )
-from app import escape_markdown
 
 
 class TestNotionParsing(unittest.TestCase):

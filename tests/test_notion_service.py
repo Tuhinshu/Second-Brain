@@ -1,24 +1,14 @@
-import unittest
-from unittest.mock import MagicMock, patch
 import os
+import unittest
+from unittest.mock import patch
 
 os.environ["NOTION_API_KEY"] = "dummy_key"
 os.environ["NOTION_TASKS_DB_ID"] = "dummy_tasks_db"
 os.environ["NOTION_ASSETS_DB_ID"] = "dummy_assets_db"
 
-import notion_service
-from notion_service import (
-    execute_with_retry,
-    create_task,
-    create_new_task,
-    start_task,
-    update_task_status,
-    delete_task,
-    inject_template_blocks_if_empty,
-    fetch_active_tasks,
-    fetch_assets,
-    TaskCapacityCoordinator,
-)
+import httpx
+from notion_client.errors import APIResponseError
+
 from Models import (
     InvalidStateTransitionError,
     NotionServiceError,
@@ -26,8 +16,16 @@ from Models import (
     TaskModel,
     TaskValidationError,
 )
-from notion_client.errors import APIResponseError
-import httpx
+from notion_service import (
+    TaskCapacityCoordinator,
+    create_new_task,
+    create_task,
+    delete_task,
+    execute_with_retry,
+    inject_template_blocks_if_empty,
+    start_task,
+    update_task_status,
+)
 
 
 class TestNotionServiceMocked(unittest.TestCase):
@@ -63,6 +61,22 @@ class TestNotionServiceMocked(unittest.TestCase):
 
         with self.assertRaises(APIResponseError):
             execute_with_retry(bad_request, max_retries=2, base_delay=0.01)
+
+    def test_execute_with_retry_does_not_retry_arbitrary_exceptions(self):
+        attempts = 0
+
+        class CustomErrorWithStatus(Exception):
+            status = 500
+
+        def buggy_operation():
+            nonlocal attempts
+            attempts += 1
+            raise CustomErrorWithStatus("Internal bug")
+
+        with self.assertRaises(CustomErrorWithStatus):
+            execute_with_retry(buggy_operation, max_retries=3, base_delay=0.01)
+        # Should fail immediately without retrying
+        self.assertEqual(attempts, 1)
 
     @patch("notion_service.notion")
     def test_create_task_calls_notion_pages_create(self, mock_notion):
@@ -102,9 +116,7 @@ class TestNotionServiceMocked(unittest.TestCase):
     @patch("notion_service.fetch_active_tasks")
     def test_create_new_task_advisory_limit(self, mock_fetch):
         # Return 50 active tasks
-        mock_fetch.return_value = [
-            TaskModel(task_name=f"Task {i}", domain="Personal") for i in range(50)
-        ]
+        mock_fetch.return_value = [TaskModel(task_name=f"Task {i}", domain="Personal") for i in range(50)]
 
         with self.assertRaises(TaskLimitError):
             create_new_task(task_name="Task 51", domain="Personal")
@@ -126,9 +138,7 @@ class TestNotionServiceMocked(unittest.TestCase):
     def test_update_task_status_fetches_remote_when_current_omitted(self, mock_notion):
         mock_notion.pages.retrieve.return_value = {
             "id": "page-123",
-            "properties": {
-                "Status": {"status": {"name": "In progress"}}
-            }
+            "properties": {"Status": {"status": {"name": "In progress"}}},
         }
         update_task_status("page-123", "Paused")
         mock_notion.pages.retrieve.assert_called_once()
@@ -157,11 +167,7 @@ class TestNotionServiceMocked(unittest.TestCase):
             "results": [
                 {
                     "type": "heading_2",
-                    "heading_2": {
-                        "rich_text": [
-                            {"plain_text": "Execution Scope & Checklist"}
-                        ]
-                    },
+                    "heading_2": {"rich_text": [{"plain_text": "Execution Scope & Checklist"}]},
                 }
             ]
         }
@@ -240,7 +246,9 @@ class TestNotionServiceMocked(unittest.TestCase):
     @patch("time.sleep")
     @patch("notion_service.inject_template_blocks_if_empty")
     @patch("notion_service.update_task_status")
-    def test_start_task_template_injection_failure_triggers_rollback(self, mock_update, mock_inject, mock_sleep):
+    def test_start_task_template_injection_failure_triggers_rollback(
+        self, mock_update, mock_inject, mock_sleep
+    ):
         mock_inject.side_effect = Exception("Persistent API error")
 
         with self.assertRaises(NotionServiceError) as ctx:

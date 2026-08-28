@@ -10,20 +10,24 @@ graph TD
     UI <--> Logic[Scoring & Ranking Engine<br>scoring_engine.py]
     UI <--> Service[Notion Service Layer<br>notion_service.py]
     
-    subgraph Exception & Validation Layer
+    subgraph Concurrency & Validation Layer
         Models[Pydantic Models & Exceptions<br>Models.py]
         Config[Config Validator<br>config.py]
+        Coord[TaskCapacityCoordinator<br>threading.Lock Mutex]
     end
     
     Service <--> Models
     Logic <--> Models
     Service <--> Config
+    Service <--> Coord
     
     subgraph Resilience Layer
-        Retry[Retry Wrapper & Exponential Backoff<br>execute_with_retry]
+        Retry[Explicit Retry Wrapper<br>execute_with_retry]
+        Rollback[Compensating Rollback Engine<br>start_task]
     end
     
     Service <--> Retry
+    Service <--> Rollback
     Retry <--> NotionAPI[(Notion REST API v2)]
     
     subgraph Notion Workspace
@@ -45,18 +49,46 @@ graph TD
 - **Session State**: Manages `active_page`, `active_domain`, and `pause_prompt_id` dynamically across hot-reloads and reruns.
 - **Modal Dialogs**: Uses Streamlit `@st.dialog` for non-disruptive task capture and destructive deletion confirmations without losing focus.
 - **Defensive Rendering**: Escapes dynamic Notion strings (`escape_markdown`) to prevent formatting breaks or prompt injections.
+- **Exception Mapping**: Catches strongly-typed domain exceptions and maps them to appropriate UI alerts (`st.warning` for validation and capacity limits, `st.error` for API errors) while logging raw tracebacks securely on the server.
 
-### 2.2 Domain, Data Validation & Exception Layer (`Models.py`)
+### 2.2 Domain, Data Validation & Exception Hierarchy (`Models.py`)
 - Built on **Pydantic v2** (`BaseModel`, `Field`, `Literal`).
 - Ensures runtime validation, strict bounds on numerical inputs ($1 \le \text{impact} \le 5$, $0.25 \le \text{estimated\_hours} \le 12.0$), and standardized types across Notion API serialization/deserialization.
 - **`TaskModel`**: Encapsulates task attributes, status, domain, impact, urgency, blockers, state anchor notes, and computed priority scores.
 - **`AssetModel`**: Encapsulates reusable knowledge items, tags (`Field(default_factory=list)`), URLs, and categorical domains.
-- **Typed Custom Exceptions**:
-  - `SecondBrainError`: Base application exception.
-  - `TaskValidationError`: Raised for missing/malformed task inputs.
-  - `TaskLimitError`: Raised when the advisory task limit is reached.
-  - `InvalidStateTransitionError`: Raised when an illegal state change is requested.
-  - `NotionServiceError`: Raised when an external Notion API operation fails.
+
+#### Custom Exception Hierarchy
+```mermaid
+classDiagram
+    Exception <|-- SecondBrainError
+    SecondBrainError <|-- NotionServiceError
+    SecondBrainError <|-- TaskValidationError
+    SecondBrainError <|-- TaskLimitError
+    SecondBrainError <|-- InvalidStateTransitionError
+
+    class SecondBrainError {
+        +Base application exception
+    }
+    class TaskValidationError {
+        +Raised for missing/malformed task inputs
+    }
+    class TaskLimitError {
+        +Raised when task capacity limit is reached
+    }
+    class InvalidStateTransitionError {
+        +Raised when an illegal state change is attempted
+    }
+    class NotionServiceError {
+        +Raised when an external Notion API operation fails
+    }
+```
+
+| Exception Type | Trigger Condition | Presentation Handling |
+|---|---|---|
+| `TaskValidationError` | Empty title or out-of-bounds parameters | `st.warning("⚠️ ...")` |
+| `TaskLimitError` | Active task count reaches `MAX_ACTIVE_TASKS` | `st.warning("⚠️ Active task limit reached...")` |
+| `InvalidStateTransitionError` | Disallowed lifecycle transition (e.g. Backlog $\to$ Paused) | `st.warning("⚠️ Invalid transition...")` |
+| `NotionServiceError` | Notion network/API failure after retries exhausted | `st.error("❌ Action failed: ...")` |
 
 ### 2.3 Task Lifecycle & State Transition Engine
 Task status transitions are strictly governed by `VALID_STATE_TRANSITIONS`. Status changes are validated both in the service layer before writing to Notion and mapped to UI indicators.
@@ -110,7 +142,8 @@ Where:
 - Implements the adapter pattern over the official `notion-client` SDK.
 - Translates Notion's nested property structures (`Title`, `Select`, `Status`, `Number`, `Checkbox`, `Rich Text`) into strongly-typed Pydantic models with defensive property extractors (`_parse_int_prop`, `_parse_float_prop`, `_extract_plain_text`).
 - **Transient Fault Tolerance (`execute_with_retry`)**:
-  - Automatically handles HTTP `429` (Rate Limited), `500`, `502`, `503`, `504` status codes and request timeouts.
+  - Automatically handles HTTP `429` (Rate Limited), `500`, `502`, `503`, `504` status codes and explicit network timeout errors.
+  - Restricted strictly to explicit retryable classes: `APIResponseError` (with retryable status) and `RETRYABLE_NETWORK_EXCEPTIONS` (`RequestTimeoutError`, `httpx.TimeoutException`, `httpx.NetworkError`, `ConnectionError`, `TimeoutError`). Non-retryable exceptions bubble up immediately.
   - Applies bounded exponential backoff with randomized jitter:
     $$\text{Delay} = \min(\text{base\_delay} \times 2^{\text{attempt}-1} + \text{jitter}, \text{max\_delay})$$
 - **Performance-Optimized Startup & Compensating Rollback (`start_task`)**:
@@ -128,6 +161,7 @@ sequenceDiagram
     actor User
     participant App as Streamlit UI (app.py)
     participant Engine as Scoring Engine
+    participant Coord as TaskCapacityCoordinator
     participant Notion as Notion Service
     participant Retry as Retry Wrapper
     participant API as Notion API
@@ -142,6 +176,25 @@ sequenceDiagram
     App>>Engine: rank_tasks(tasks)
     Engine>>App: Sorted & Pinned Task Queue
     App>>User: Renders Top 3 Arena + Backlog Drawer
+
+    opt User creates New Task (Atomic Reservation)
+        User>>App: Submits Add Task Dialog
+        App>>Notion: create_new_task(name, domain, ...)
+        Notion>>Coord: reserve_and_create()
+        Note over Coord: Acquires in-process mutex lock
+        Coord->>Notion: count_active_tasks()
+        alt Count >= MAX_ACTIVE_TASKS
+            Coord-->>App: Raises TaskLimitError
+            App-->>User: Displays Warning (Capacity Reached)
+        else Capacity Available
+            Coord->>Retry: execute_with_retry(pages.create)
+            Retry->>API: POST /v1/pages
+            API-->>Retry: 200 OK (page_id)
+            Note over Coord: Releases mutex lock
+            Coord-->>App: Returns created TaskModel
+            App-->>User: Refreshes with new task in queue
+        end
+    end
 
     opt User clicks "Start Task" (Unstarted with Retry & Rollback)
         User>>App: Click 'Start'
@@ -198,19 +251,19 @@ The **State Anchor Protocol** solves this:
 
 ## 5. Concurrency Model & Backend-Controlled Counter Strategy
 
-### 5.1 Backend Concurrency Coordinator (`TaskCapacityCoordinator`)
-- **Problem**: When multiple user sessions simultaneously invoke task creation near capacity, a naive read-then-create (`fetch_active_tasks -> create_task`) sequence can suffer from race conditions (Time-of-Check to Time-of-Use / TOCTOU), allowing multiple concurrent requests to pass the count check and overshoot `MAX_ACTIVE_TASKS`.
-- **Solution**: The backend implements `TaskCapacityCoordinator` utilizing a thread-safe mutual exclusion lock (`threading.Lock`):
+### 5.1 In-Process Concurrency Coordinator (`TaskCapacityCoordinator`)
+- **Problem**: When multiple user sessions simultaneously invoke task creation near capacity, a naive read-then-create (`fetch_active_tasks -> create_task`) sequence can suffer from race conditions (Time-of-Check to Time-of-Use / TOCTOU), allowing concurrent requests to pass the count check and overshoot `MAX_ACTIVE_TASKS`.
+- **Solution**: The backend implements `TaskCapacityCoordinator` utilizing an in-process thread-safe mutual exclusion lock (`threading.Lock`):
   1. **Atomic Reservation**: Acquires the lock before reading active tasks.
   2. **Capacity Assertion**: If $\text{Active Tasks} \ge \text{MAX\_ACTIVE\_TASKS}$, immediately aborts and raises `TaskLimitError` before initiating any Notion REST calls.
   3. **Synchronized Creation**: Executes Notion page creation and invalidates the cached task list within the critical section.
-  4. **Strict Capacity Enforcement**: Eliminates concurrent creation interleaving across multi-threaded Streamlit user sessions.
+  4. **Single-Process Enforcement**: Guarantees strict serialization across concurrent threads in a standard Streamlit process.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor ClientA as Session A
-    actor ClientB as Session B
+    actor ClientA as Session A (Thread 1)
+    actor ClientB as Session B (Thread 2)
     participant Coord as TaskCapacityCoordinator (Mutex)
     participant Service as Notion Service Layer
     participant Notion as Notion API
@@ -230,10 +283,17 @@ sequenceDiagram
     Coord-->>ClientB: Raises TaskLimitError (Capacity Reached)
 ```
 
-### 5.2 Config & Bounds Validation
-- `config._parse_max_active_tasks` validates `MAX_ACTIVE_TASKS` on startup, enforcing valid positive integers within range ($1 \le \text{MAX\_ACTIVE\_TASKS} \le 500$) with actionable error messages for malformed environment deployments.
+### 5.2 In-Process vs. Distributed Multi-Process Deployment Scope
+- **In-Process Scope**: `threading.Lock` provides mutual exclusion across threads sharing the same Python interpreter process (standard for single-instance Streamlit deployments, Streamlit Community Cloud, or local execution).
+- **Multi-Process / Distributed Deployments**: When scaled horizontally across independent OS processes, multi-container replicas, or distributed server clusters, in-process memory locks do not share state. In such distributed architectures:
+  - `MAX_ACTIVE_TASKS` acts as an **application-level advisory soft limit**.
+  - Strict distributed locking would require an external distributed lock provider (e.g. Redis `Redlock`, a shared PostgreSQL advisory lock, or a centralized lease coordinator).
 
-### 5.3 Server-Side Logging & Client Error Sanitization
+### 5.3 Config & Bounds Validation
+- `config._parse_max_active_tasks` validates `MAX_ACTIVE_TASKS` on startup, enforcing valid positive integers within range ($1 \le \text{MAX\_ACTIVE\_TASKS} \le 500$) with actionable error messages for malformed environment deployments.
+- Missing configuration values produce deployment-neutral error messages suitable for local, containerized, and cloud secret managers.
+
+### 5.4 Server-Side Logging & Client Error Sanitization
 - All unexpected errors and external API failures are logged server-side via Python's standard `logging` library (`logger.exception()`) with full stack traces.
 - Presentation layers in `app.py` expose sanitized, user-friendly feedback to prevent leaking sensitive API tokens, database IDs, or internal network topology.
 
@@ -245,17 +305,19 @@ The project includes an automated Continuous Integration pipeline ([`.github/wor
 
 ```mermaid
 graph LR
-    Push[Git Push / PR] --> Compile[Python Bytecode Compilation<br>py_compile]
-    Compile --> TestSuite[Automated Test Suite<br>38 Unit & Mocked Integration Tests]
+    Push[Git Push / PR] --> Lint[Static Lint & Style Gate<br>Ruff Analyzer & Formatter]
+    Lint --> Compile[Python Bytecode Compilation<br>py_compile]
+    Compile --> TestSuite[Automated Test Suite<br>42 Unit & Mocked Integration Tests]
     TestSuite --> SecurityScan[Secret Scanning Gate<br>Gitleaks Analyzer]
     SecurityScan --> Deploy[Ready for Deployment]
 ```
 
-1. **Bytecode Compilation**: Validates syntax across all source files via `python -m py_compile`.
-2. **Automated Test Suite**: Executes 38 comprehensive unit and integration tests across:
-   - `test_models.py`: Data models, bounds validation, and state machine transitions.
-   - `test_scoring_engine.py`: Multi-factor priority calculations and pinning rules.
-   - `test_notion_parsing.py`: Defensive Notion JSON property extractors and markdown escaping.
-   - `test_notion_service.py`: Retry wrappers, API error recovery, idempotency, and status updates.
-   - `test_config.py`: Environment configuration bounds and error handling.
-3. **Automated Secret Scanning**: Runs `gitleaks` across the commit history to enforce zero-secret commitments.
+1. **Static Linting & Style Gate (Ruff)**: Enforces Python code hygiene, style consistency (PEP 8), import sorting (`isort`), modern Python 3.11 idiom upgrades (`pyupgrade`), and defect prevention (`flake8-bugbear`, `flake8-comprehensions`, `flake8-simplify`).
+2. **Bytecode Compilation**: Validates syntax across all source files via `python -m py_compile`.
+3. **Automated Test Suite**: Executes 42 comprehensive unit and integration tests across:
+   - `test_models.py` (6 tests): Data models, bounds validation, and state machine transitions.
+   - `test_scoring_engine.py` (4 tests): Multi-factor priority calculations and pinning rules.
+   - `test_notion_parsing.py` (8 tests): Defensive Notion JSON property extractors, fallback log emissions, and markdown escaping.
+   - `test_notion_service.py` (20 tests): Retry wrappers, explicit exception filtering, concurrency coordinator thread safety, template injection idempotency, retry/compensating rollback, and status updates.
+   - `test_config.py` (4 tests): Environment configuration bounds, positive integer parsing, and actionable error messages.
+4. **Automated Secret Scanning**: Runs `gitleaks` across the commit history to enforce zero-secret commitments.

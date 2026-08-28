@@ -2,16 +2,14 @@ import base64
 import logging
 import os
 import re
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import streamlit as st
 
-import config
 from Models import (
     InvalidStateTransitionError,
     NotionServiceError,
     TaskLimitError,
-    TaskModel,
     TaskValidationError,
 )
 from notion_service import (
@@ -37,7 +35,7 @@ def escape_markdown(text: str) -> str:
 
 def run_notion_action(
     action_fn: Callable[[], None],
-    success_msg: Optional[str] = None,
+    success_msg: str | None = None,
     error_prefix: str = "Operation failed",
 ) -> None:
     """Unified handler for executing Notion API mutations with error handling, cache clearing, and UI reruns."""
@@ -302,6 +300,7 @@ def render_state_anchor_modal() -> None:
         c1, c2 = st.columns([1, 4])
         if c1.button("Save & Pause", type="primary"):
             if anchor_text.strip():
+
                 def _pause_action():
                     update_task_status(
                         st.session_state.pause_prompt_id,
@@ -351,9 +350,7 @@ def render_execution_arena() -> None:
             c_info, c_actions = st.columns([1.6, 1.4])
 
             with c_info:
-                status_badge = (
-                    f"**[{task.status.upper()}]**" if is_active else f"[{task.status}]"
-                )
+                status_badge = f"**[{task.status.upper()}]**" if is_active else f"[{task.status}]"
                 st.markdown(f"### {idx + 1}. {escape_markdown(task.task_name)}")
                 st.markdown(
                     f"{status_badge} `{escape_markdown(task.domain)}` | "
@@ -370,9 +367,8 @@ def render_execution_arena() -> None:
                 if task.status != "In progress":
                     btn_label = "Resume" if task.status == "Paused" else "Start"
                     toast_label = "Resumed" if task.status == "Paused" else "Started"
-                    if col_b1.button(
-                        btn_label, key=f"start_{task.id}", use_container_width=True
-                    ):
+                    if col_b1.button(btn_label, key=f"start_{task.id}", use_container_width=True):
+
                         def _start_action(t_id=task.id, t_status=task.status):
                             start_task(t_id, current_status=t_status)
 
@@ -382,9 +378,7 @@ def render_execution_arena() -> None:
                             "Failed to start task",
                         )
                 else:
-                    if col_b1.button(
-                        "Pause", key=f"pause_{task.id}", use_container_width=True
-                    ):
+                    if col_b1.button("Pause", key=f"pause_{task.id}", use_container_width=True):
                         st.session_state.pause_prompt_id = task.id
                         st.rerun()
 
@@ -402,9 +396,7 @@ def render_execution_arena() -> None:
                         "Failed to complete task",
                     )
 
-                if col_b3.button(
-                    "🗑️ Delete", key=f"del_{task.id}", use_container_width=True
-                ):
+                if col_b3.button("🗑️ Delete", key=f"del_{task.id}", use_container_width=True):
                     confirm_delete_dialog(task.id, task.task_name)
 
     if backlog_tasks:
@@ -418,9 +410,7 @@ def render_execution_arena() -> None:
                         f"Score: `{b_task.priority_score}` | Est: `{b_task.estimated_hours}h`"
                     )
                 with b_col2:
-                    if st.button(
-                        "Promote", key=f"promote_{b_task.id}", use_container_width=True
-                    ):
+                    if st.button("Promote", key=f"promote_{b_task.id}", use_container_width=True):
                         run_notion_action(
                             lambda bt_id=b_task.id, bt_status=b_task.status: update_task_status(
                                 bt_id, "Not started", current_status=bt_status
@@ -429,9 +419,7 @@ def render_execution_arena() -> None:
                             "Failed to promote task",
                         )
                 with b_col3:
-                    if st.button(
-                        "🗑️ Delete", key=f"del_{b_task.id}", use_container_width=True
-                    ):
+                    if st.button("🗑️ Delete", key=f"del_{b_task.id}", use_container_width=True):
                         confirm_delete_dialog(b_task.id, b_task.task_name)
 
 
@@ -461,9 +449,7 @@ def render_asset_vault() -> None:
                             st.caption(f"Tags: {escaped_tags}")
                     with a_link:
                         if asset.url:
-                            st.link_button(
-                                "Open Resources", asset.url, use_container_width=True
-                            )
+                            st.link_button("Open Resources", asset.url, use_container_width=True)
                         else:
                             st.caption("No URL attached")
     except Exception as e:

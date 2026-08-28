@@ -10,9 +10,32 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Static Linting & Style Gate (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Ruff Lint & Format Checks
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: "check ."
+
+      - name: Run Ruff Format Verification
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: "format --check ."
+
   test:
     name: Run Unit & Integration Tests
     runs-on: ubuntu-latest
+    needs: lint
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

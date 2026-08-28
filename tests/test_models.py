@@ -1,6 +1,8 @@
 import unittest
+
 from pydantic import ValidationError
-from Models import TaskModel, AssetModel, VALID_STATE_TRANSITIONS
+
+from Models import VALID_STATE_TRANSITIONS, AssetModel, TaskModel
 
 
 class TestTaskModel(unittest.TestCase):

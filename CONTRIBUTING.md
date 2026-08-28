@@ -76,15 +76,22 @@ Please maintain a welcoming, inclusive, and professional environment for everyon
    - **Never commit `.env` or sensitive API keys.**
 
 3. **Code Quality & Verification**:
-   Before submitting your changes, run compilation and the automated test suite:
+   Before submitting your changes, run static linting, formatting checks, compilation, and the test suite:
    ```bash
-   # 1. Verify Python syntax and bytecode compilation
+   # 1. Run Ruff linter and code style checks
+   ruff check .
+   ruff format --check .
+
+   # Automatically format code if needed:
+   ruff format .
+
+   # 2. Verify Python syntax and bytecode compilation
    python -m py_compile app.py config.py notion_service.py Models.py scoring_engine.py
 
-   # 2. Run the automated test suite (38 unit & integration tests)
+   # 3. Run the automated test suite (42 unit & integration tests)
    python -m unittest discover tests -v
 
-   # 3. Test locally in the browser
+   # 4. Test locally in the browser
    streamlit run app.py
    ```
 

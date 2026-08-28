@@ -2,14 +2,17 @@ import logging
 import random
 import threading
 import time
-from typing import Any, Callable, List, Optional, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
+import httpx
 import streamlit as st
 from notion_client import Client
 from notion_client.errors import APIResponseError, RequestTimeoutError
 
 import config
 from Models import (
+    VALID_STATE_TRANSITIONS,
     AssetModel,
     InvalidStateTransitionError,
     NotionServiceError,
@@ -18,25 +21,33 @@ from Models import (
     TaskModel,
     TaskStatus,
     TaskValidationError,
-    VALID_STATE_TRANSITIONS,
 )
 
 logger = logging.getLogger("second_brain.service")
 
 T = TypeVar("T")
 RETRYABLE_STATUS_CODES: set[int] = {429, 500, 502, 503, 504}
+RETRYABLE_NETWORK_EXCEPTIONS = (
+    RequestTimeoutError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    ConnectionError,
+    TimeoutError,
+)
 
 notion = Client(auth=config.NOTION_API_KEY)
+
 
 def execute_with_retry(
     operation: Callable[[], T],
     max_retries: int = 3,
     base_delay: float = 0.5,
-    max_delay: float = 4.0
+    max_delay: float = 4.0,
 ) -> T:
     """
-    Executes a Notion API call with bounded exponential backoff and jitter
-    for transient HTTP and rate-limit errors (429, 5xx, timeouts).
+    Executes a Notion API call with bounded exponential backoff and jitter,
+    strictly restricted to explicit retryable exception classes (APIResponseError
+    with retryable HTTP status code, or explicit network/timeout exceptions).
     """
     attempt = 0
     while True:
@@ -49,26 +60,19 @@ def execute_with_retry(
             attempt += 1
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.1))
             time.sleep(delay)
-        except (RequestTimeoutError, ConnectionError, TimeoutError):
+        except RETRYABLE_NETWORK_EXCEPTIONS:
             if attempt >= max_retries:
                 raise
             attempt += 1
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.1))
             time.sleep(delay)
-        except Exception as err:
-            status = getattr(err, "status", getattr(err, "status_code", None))
-            if status in RETRYABLE_STATUS_CODES and attempt < max_retries:
-                attempt += 1
-                delay = min(max_delay, base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.1))
-                time.sleep(delay)
-            else:
-                raise
 
 
 VALID_STATUSES: set[str] = {"Backlog", "Not started", "In progress", "Paused", "Done"}
 VALID_DOMAINS: set[str] = {"AIESEC", "Academics", "Clients", "Personal"}
 
-def _extract_plain_text(prop: Optional[dict], key: str = "title") -> str:
+
+def _extract_plain_text(prop: dict | None, key: str = "title") -> str:
     if not isinstance(prop, dict):
         return ""
     items = prop.get(key)
@@ -78,7 +82,8 @@ def _extract_plain_text(prop: Optional[dict], key: str = "title") -> str:
             return str(first.get("plain_text", "")).strip()
     return ""
 
-def _parse_int_prop(prop: Optional[dict], default: int = 3, min_val: int = 1, max_val: int = 5) -> int:
+
+def _parse_int_prop(prop: dict | None, default: int = 3, min_val: int = 1, max_val: int = 5) -> int:
     """Explicitly extracts and bounds an integer property, checking `is None` rather than relying on truthiness."""
     if not isinstance(prop, dict):
         return default
@@ -91,7 +96,10 @@ def _parse_int_prop(prop: Optional[dict], default: int = 3, min_val: int = 1, ma
     except (ValueError, TypeError):
         return default
 
-def _parse_float_prop(prop: Optional[dict], default: float = 1.0, min_val: float = 0.25, max_val: float = 12.0) -> float:
+
+def _parse_float_prop(
+    prop: dict | None, default: float = 1.0, min_val: float = 0.25, max_val: float = 12.0
+) -> float:
     """Explicitly extracts and bounds a float property, checking `is None` rather than relying on truthiness."""
     if not isinstance(prop, dict):
         return default
@@ -103,6 +111,7 @@ def _parse_float_prop(prop: Optional[dict], default: float = 1.0, min_val: float
         return max(min_val, min(max_val, num))
     except (ValueError, TypeError):
         return default
+
 
 def parse_task_page(page: dict) -> TaskModel:
     if not isinstance(page, dict):
@@ -166,8 +175,9 @@ def parse_task_page(page: dict) -> TaskModel:
         urgency=urgency,
         estimated_hours=estimated_hours,
         someone_waiting=someone_waiting,
-        state_anchor=state_anchor
+        state_anchor=state_anchor,
     )
+
 
 def parse_asset_page(page: dict) -> AssetModel:
     if not isinstance(page, dict):
@@ -199,28 +209,20 @@ def parse_asset_page(page: dict) -> AssetModel:
     tags = [t.get("name", "") for t in tags_list if isinstance(t, dict) and t.get("name")]
 
     return AssetModel(
-        id=str(page.get("id", "")),
-        title=title,
-        type=asset_type,
-        domain=domain,
-        url=url,
-        tags=tags
+        id=str(page.get("id", "")), title=title, type=asset_type, domain=domain, url=url, tags=tags
     )
 
+
 @st.cache_data(ttl=60)
-def fetch_active_tasks(domain_filter: Optional[str] = None) -> List[TaskModel]:
-    filter_conditions = [
-        {"property": "Status", "status": {"does_not_equal": "Done"}}
-    ]
+def fetch_active_tasks(domain_filter: str | None = None) -> list[TaskModel]:
+    filter_conditions = [{"property": "Status", "status": {"does_not_equal": "Done"}}]
 
     if domain_filter and domain_filter != "Global":
-        filter_conditions.append(
-            {"property": "Domain", "select": {"equals": domain_filter}}
-        )
+        filter_conditions.append({"property": "Domain", "select": {"equals": domain_filter}})
 
     query_payload = {
         "database_id": config.NOTION_TASKS_DB_ID,
-        "filter": {"and": filter_conditions} if len(filter_conditions) > 1 else filter_conditions[0]
+        "filter": {"and": filter_conditions} if len(filter_conditions) > 1 else filter_conditions[0],
     }
 
     response = execute_with_retry(lambda: notion.databases.query(**query_payload))
@@ -238,26 +240,28 @@ def create_task(task: TaskModel) -> str:
         "Estimated Hours": {"number": task.estimated_hours},
         "Someone Waiting?": {"checkbox": task.someone_waiting},
     }
-    
+
     if task.state_anchor:
-        properties["State Anchor"] = {
-            "rich_text": [{"text": {"content": task.state_anchor}}]
-        }
+        properties["State Anchor"] = {"rich_text": [{"text": {"content": task.state_anchor}}]}
 
     response = execute_with_retry(
-        lambda: notion.pages.create(
-            parent={"database_id": config.NOTION_TASKS_DB_ID},
-            properties=properties
-        )
+        lambda: notion.pages.create(parent={"database_id": config.NOTION_TASKS_DB_ID}, properties=properties)
     )
     return response["id"]
 
 
 class TaskCapacityCoordinator:
     """
-    Backend concurrency coordinator implementing thread-safe synchronization
+    In-process concurrency coordinator implementing thread-safe synchronization
     and atomic task reservation to eliminate read-then-create race conditions
-    across concurrent sessions.
+    across concurrent threads within the same Python process.
+
+    Scope & Distributed Architecture Note:
+        This coordinator guarantees atomicity for multiple sessions sharing the same
+        process instance (e.g. standard Streamlit server deployments). If deploying
+        across multiple independent OS processes, container replicas, or distributed
+        hosts, an external distributed lock / transactional counter (e.g. Redis Redlock
+        or a centralized database lease) should be integrated.
     """
 
     def __init__(self) -> None:
@@ -270,7 +274,7 @@ class TaskCapacityCoordinator:
         max_limit: int,
     ) -> TaskModel:
         """
-        Acquires mutual exclusion lock, checks active task count atomically,
+        Acquires in-process mutual exclusion lock, checks active task count atomically,
         and creates the task if capacity is available.
         """
         with self._lock:
@@ -296,11 +300,13 @@ def create_new_task(
 ) -> TaskModel:
     """
     Validates business rules and executes task creation in Notion using
-    a backend-controlled atomic counter strategy.
+    an in-process synchronized counter strategy.
 
-    Concurrency Control:
-        Uses TaskCapacityCoordinator to serialize concurrent session requests,
-        eliminating read-then-create race conditions.
+    Concurrency Scope:
+        Uses TaskCapacityCoordinator to serialize concurrent user threads within
+        the application process, eliminating single-process read-then-create race conditions.
+        For multi-process or multi-replica clusters, treat MAX_ACTIVE_TASKS as an
+        application-level advisory soft limit unless backed by a distributed locking backend.
 
     Raises:
         TaskValidationError: If task title is empty.
@@ -342,9 +348,7 @@ def create_new_task(
     except (TaskValidationError, TaskLimitError):
         raise
     except Exception as e:
-        logger.exception(
-            "Unexpected error while creating task '%s' in Notion: %s", clean_name, str(e)
-        )
+        logger.exception("Unexpected error while creating task '%s' in Notion: %s", clean_name, str(e))
         raise NotionServiceError(f"Failed to create task '{clean_name}' in Notion.") from e
 
 
@@ -357,8 +361,8 @@ def validate_state_transition(current_status: TaskStatus, new_status: TaskStatus
 def update_task_status(
     page_id: str,
     new_status: TaskStatus,
-    state_anchor: Optional[str] = None,
-    current_status: Optional[TaskStatus] = None,
+    state_anchor: str | None = None,
+    current_status: TaskStatus | None = None,
 ) -> None:
     """
     Updates the status and optional state anchor of a Notion task page,
@@ -386,20 +390,16 @@ def update_task_status(
             f"Allowed transitions: {sorted(allowed)}"
         )
 
-    properties = {
-        "Status": {"status": {"name": new_status}}
-    }
+    properties = {"Status": {"status": {"name": new_status}}}
 
     if state_anchor is not None:
-        properties["State Anchor"] = {
-            "rich_text": [{"text": {"content": state_anchor}}]
-        }
+        properties["State Anchor"] = {"rich_text": [{"text": {"content": state_anchor}}]}
 
     try:
         execute_with_retry(lambda: notion.pages.update(page_id=page_id, properties=properties))
     except Exception as e:
         logger.exception("Failed to update status for task %s in Notion: %s", page_id, str(e))
-        raise NotionServiceError(f"Failed to update task status in Notion.") from e
+        raise NotionServiceError("Failed to update task status in Notion.") from e
 
 
 def delete_task(page_id: str) -> None:
@@ -408,10 +408,11 @@ def delete_task(page_id: str) -> None:
         execute_with_retry(lambda: notion.pages.update(page_id=page_id, archived=True))
     except Exception as e:
         logger.exception("Failed to delete task %s in Notion: %s", page_id, str(e))
-        raise NotionServiceError(f"Failed to delete task in Notion.") from e
+        raise NotionServiceError("Failed to delete task in Notion.") from e
 
 
 TEMPLATE_MARKER_HEADING = "Execution Scope & Checklist"
+
 
 def inject_template_blocks_if_empty(page_id: str) -> bool:
     """
@@ -435,24 +436,18 @@ def inject_template_blocks_if_empty(page_id: str) -> bool:
             {
                 "object": "block",
                 "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [{"type": "text", "text": {"content": TEMPLATE_MARKER_HEADING}}]
-                }
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": TEMPLATE_MARKER_HEADING}}]},
             },
             {
                 "object": "block",
                 "type": "to_do",
-                "to_do": {
-                    "rich_text": [{"type": "text", "text": {"content": "Initial breakdown & setup"}}]
-                }
+                "to_do": {"rich_text": [{"type": "text", "text": {"content": "Initial breakdown & setup"}}]},
             },
             {
                 "object": "block",
                 "type": "to_do",
-                "to_do": {
-                    "rich_text": [{"type": "text", "text": {"content": "Core deliverable execution"}}]
-                }
-            }
+                "to_do": {"rich_text": [{"type": "text", "text": {"content": "Core deliverable execution"}}]},
+            },
         ]
         execute_with_retry(lambda: notion.blocks.children.append(block_id=page_id, children=default_blocks))
         return True
@@ -462,7 +457,7 @@ def inject_template_blocks_if_empty(page_id: str) -> bool:
 
 def start_task(
     page_id: str,
-    current_status: Optional[TaskStatus] = None,
+    current_status: TaskStatus | None = None,
     inject_template: bool = True,
     max_template_retries: int = 3,
 ) -> None:
@@ -484,7 +479,7 @@ def start_task(
 
     if current_status != "Paused" and inject_template:
         template_injected = False
-        template_error: Optional[Exception] = None
+        template_error: Exception | None = None
 
         for attempt in range(1, max_template_retries + 1):
             try:
@@ -531,15 +526,13 @@ def start_task(
 
 
 @st.cache_data(ttl=60)
-def fetch_assets(domain_filter: Optional[str] = None, search_query: Optional[str] = None) -> List[AssetModel]:
+def fetch_assets(domain_filter: str | None = None, search_query: str | None = None) -> list[AssetModel]:
     if not config.NOTION_ASSETS_DB_ID:
         return []
 
     filter_conditions = []
     if domain_filter and domain_filter not in ["Global", "All"]:
-        filter_conditions.append(
-            {"property": "Domain", "select": {"equals": domain_filter}}
-        )
+        filter_conditions.append({"property": "Domain", "select": {"equals": domain_filter}})
 
     query_payload = {"database_id": config.NOTION_ASSETS_DB_ID}
     if filter_conditions:
@@ -551,7 +544,8 @@ def fetch_assets(domain_filter: Optional[str] = None, search_query: Optional[str
     if search_query:
         query_lower = search_query.lower()
         assets = [
-            a for a in assets 
+            a
+            for a in assets
             if query_lower in a.title.lower() or any(query_lower in t.lower() for t in a.tags)
         ]
 
