@@ -1,11 +1,12 @@
 import logging
 import random
+import threading
 import time
 from typing import Any, Callable, List, Optional, TypeVar
 
 import streamlit as st
 from notion_client import Client
-from notion_client.errors import APIResponseError, HTTPResponseError, RequestTimeoutError
+from notion_client.errors import APIResponseError, RequestTimeoutError
 
 import config
 from Models import (
@@ -252,6 +253,39 @@ def create_task(task: TaskModel) -> str:
     return response["id"]
 
 
+class TaskCapacityCoordinator:
+    """
+    Backend concurrency coordinator implementing thread-safe synchronization
+    and atomic task reservation to eliminate read-then-create race conditions
+    across concurrent sessions.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def reserve_and_create(
+        self,
+        create_fn: Callable[[], TaskModel],
+        count_fn: Callable[[], int],
+        max_limit: int,
+    ) -> TaskModel:
+        """
+        Acquires mutual exclusion lock, checks active task count atomically,
+        and creates the task if capacity is available.
+        """
+        with self._lock:
+            current_count = count_fn()
+            if current_count >= max_limit:
+                raise TaskLimitError(
+                    f"Active task limit reached ({max_limit} tasks). "
+                    "Please complete or delete existing tasks before adding a new one."
+                )
+            return create_fn()
+
+
+capacity_coordinator = TaskCapacityCoordinator()
+
+
 def create_new_task(
     task_name: str,
     domain: TaskDomain,
@@ -261,7 +295,12 @@ def create_new_task(
     someone_waiting: bool = False,
 ) -> TaskModel:
     """
-    Validates business rules and executes task creation in Notion.
+    Validates business rules and executes task creation in Notion using
+    a backend-controlled atomic counter strategy.
+
+    Concurrency Control:
+        Uses TaskCapacityCoordinator to serialize concurrent session requests,
+        eliminating read-then-create race conditions.
 
     Raises:
         TaskValidationError: If task title is empty.
@@ -275,29 +314,37 @@ def create_new_task(
     if not clean_name:
         raise TaskValidationError("Please provide a task title.")
 
-    active_tasks = fetch_active_tasks("Global")
-    if len(active_tasks) >= config.MAX_ACTIVE_TASKS:
-        raise TaskLimitError(
-            f"Active task limit reached ({config.MAX_ACTIVE_TASKS} tasks). "
-            "Please complete or delete existing tasks before adding a new one."
-        )
+    def _count() -> int:
+        active_tasks = fetch_active_tasks("Global")
+        return len(active_tasks)
 
-    task_payload = TaskModel(
-        task_name=clean_name,
-        domain=domain,
-        status="Not started",
-        impact=impact,
-        urgency=urgency,
-        estimated_hours=estimated_hours,
-        someone_waiting=someone_waiting,
-    )
-    try:
+    def _create() -> TaskModel:
+        task_payload = TaskModel(
+            task_name=clean_name,
+            domain=domain,
+            status="Not started",
+            impact=impact,
+            urgency=urgency,
+            estimated_hours=estimated_hours,
+            someone_waiting=someone_waiting,
+        )
         page_id = create_task(task_payload)
         task_payload.id = page_id
         fetch_active_tasks.clear()
         return task_payload
+
+    try:
+        return capacity_coordinator.reserve_and_create(
+            create_fn=_create,
+            count_fn=_count,
+            max_limit=config.MAX_ACTIVE_TASKS,
+        )
+    except (TaskValidationError, TaskLimitError):
+        raise
     except Exception as e:
-        logger.exception("Unexpected error while creating task '%s' in Notion: %s", clean_name, str(e))
+        logger.exception(
+            "Unexpected error while creating task '%s' in Notion: %s", clean_name, str(e)
+        )
         raise NotionServiceError(f"Failed to create task '{clean_name}' in Notion.") from e
 
 
@@ -417,19 +464,70 @@ def start_task(
     page_id: str,
     current_status: Optional[TaskStatus] = None,
     inject_template: bool = True,
+    max_template_retries: int = 3,
 ) -> None:
     """
     Transitions a task to 'In progress' and conditionally injects execution template blocks.
 
+    Resilience & Compensating Rollback:
+        If template injection fails, it retries up to `max_template_retries` with exponential
+        backoff. If all attempts fail, it executes a compensating rollback on the task status
+        (restoring it to its original status, e.g. 'Not started') and raises NotionServiceError
+        so the task is never left orphaned in 'In progress' without its checklist template.
+
     Performance & Network Optimization:
         If current_status is 'Paused', template block inspection is bypassed to eliminate
         redundant Notion API network roundtrips, since paused tasks have already been
-        initialized with checklist content. For unstarted tasks, template block insertion
-        is conditionally executed if the page body is empty.
+        initialized with checklist content.
     """
     update_task_status(page_id, "In progress", current_status=current_status)
+
     if current_status != "Paused" and inject_template:
-        inject_template_blocks_if_empty(page_id)
+        template_injected = False
+        template_error: Optional[Exception] = None
+
+        for attempt in range(1, max_template_retries + 1):
+            try:
+                inject_template_blocks_if_empty(page_id)
+                template_injected = True
+                break
+            except Exception as exc:
+                template_error = exc
+                logger.warning(
+                    "Template injection attempt %d/%d failed for task %s: %s",
+                    attempt,
+                    max_template_retries,
+                    page_id,
+                    str(exc),
+                )
+                if attempt < max_template_retries:
+                    time.sleep(0.25 * (2 ** (attempt - 1)))
+
+        if not template_injected and template_error is not None:
+            rollback_status: TaskStatus = (
+                current_status
+                if current_status and current_status in VALID_STATUSES and current_status != "In progress"
+                else "Not started"
+            )
+            logger.error(
+                "Template injection failed after %d attempts for task %s. Rolling back status to '%s'.",
+                max_template_retries,
+                page_id,
+                rollback_status,
+            )
+            try:
+                update_task_status(page_id, rollback_status, current_status="In progress")
+            except Exception as rollback_err:
+                logger.critical(
+                    "Compensating rollback failed for task %s: %s",
+                    page_id,
+                    str(rollback_err),
+                )
+
+            raise NotionServiceError(
+                f"Failed to initialize checklist template for task. "
+                f"Status was safely rolled back to '{rollback_status}'."
+            ) from template_error
 
 
 @st.cache_data(ttl=60)

@@ -8,9 +8,9 @@ NOTION_TASKS_DB_ID = os.getenv("NOTION_TASKS_DB_ID", "").strip()
 NOTION_ASSETS_DB_ID = os.getenv("NOTION_ASSETS_DB_ID", "").strip()
 
 if not NOTION_API_KEY:
-    raise ValueError("CRITICAL: NOTION_API_KEY is not set in .env")
+    raise ValueError("CRITICAL: NOTION_API_KEY is not set as an environment variable or deployment secret.")
 if not NOTION_TASKS_DB_ID:
-    raise ValueError("CRITICAL: NOTION_TASKS_DB_ID is not set in .env")
+    raise ValueError("CRITICAL: NOTION_TASKS_DB_ID is not set as an environment variable or deployment secret.")
 
 def _parse_max_active_tasks(
     raw_val: str, default: int = 50, min_val: int = 1, max_val: int = 500

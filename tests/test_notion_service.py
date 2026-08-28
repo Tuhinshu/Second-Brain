@@ -17,6 +17,7 @@ from notion_service import (
     inject_template_blocks_if_empty,
     fetch_active_tasks,
     fetch_assets,
+    TaskCapacityCoordinator,
 )
 from Models import (
     InvalidStateTransitionError,
@@ -182,6 +183,74 @@ class TestNotionServiceMocked(unittest.TestCase):
         start_task("page-123", current_status="Paused")
         mock_update.assert_called_once_with("page-123", "In progress", current_status="Paused")
         mock_inject.assert_not_called()
+
+    def test_capacity_coordinator_thread_safe_concurrency(self):
+        import concurrent.futures
+
+        coordinator = TaskCapacityCoordinator()
+        shared_tasks = [TaskModel(task_name=f"Task {i}", domain="Personal") for i in range(48)]
+        success_count = 0
+        limit_error_count = 0
+
+        def simulate_client_creation(client_id: int):
+            nonlocal success_count, limit_error_count
+
+            def _count():
+                return len(shared_tasks)
+
+            def _create():
+                t = TaskModel(task_name=f"New Task {client_id}", domain="Personal")
+                shared_tasks.append(t)
+                return t
+
+            try:
+                coordinator.reserve_and_create(_create, _count, max_limit=50)
+                success_count += 1
+            except TaskLimitError:
+                limit_error_count += 1
+
+        # Launch 10 simultaneous threads attempting to create tasks
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(simulate_client_creation, i) for i in range(10)]
+            concurrent.futures.wait(futures)
+
+        # Exactly 2 should succeed to reach 50, and 8 should fail with TaskLimitError
+        self.assertEqual(len(shared_tasks), 50)
+        self.assertEqual(success_count, 2)
+        self.assertEqual(limit_error_count, 8)
+
+    @patch("time.sleep")
+    @patch("notion_service.inject_template_blocks_if_empty")
+    @patch("notion_service.update_task_status")
+    def test_start_task_template_injection_retry_succeeds(self, mock_update, mock_inject, mock_sleep):
+        attempts = 0
+
+        def flaky_injection(pid):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 2:
+                raise Exception("Transient network glitch")
+            return True
+
+        mock_inject.side_effect = flaky_injection
+        start_task("page-123", current_status="Not started", max_template_retries=3)
+        self.assertEqual(attempts, 2)
+        mock_update.assert_called_once_with("page-123", "In progress", current_status="Not started")
+
+    @patch("time.sleep")
+    @patch("notion_service.inject_template_blocks_if_empty")
+    @patch("notion_service.update_task_status")
+    def test_start_task_template_injection_failure_triggers_rollback(self, mock_update, mock_inject, mock_sleep):
+        mock_inject.side_effect = Exception("Persistent API error")
+
+        with self.assertRaises(NotionServiceError) as ctx:
+            start_task("page-123", current_status="Not started", max_template_retries=3)
+
+        self.assertIn("rolled back to 'Not started'", str(ctx.exception))
+        # Initial transition to 'In progress' + rollback transition back to 'Not started'
+        self.assertEqual(mock_update.call_count, 2)
+        mock_update.assert_any_call("page-123", "In progress", current_status="Not started")
+        mock_update.assert_any_call("page-123", "Not started", current_status="In progress")
 
 
 if __name__ == "__main__":

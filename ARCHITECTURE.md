@@ -113,9 +113,10 @@ Where:
   - Automatically handles HTTP `429` (Rate Limited), `500`, `502`, `503`, `504` status codes and request timeouts.
   - Applies bounded exponential backoff with randomized jitter:
     $$\text{Delay} = \min(\text{base\_delay} \times 2^{\text{attempt}-1} + \text{jitter}, \text{max\_delay})$$
-- **Performance-Optimized Startup (`start_task`)**:
+- **Performance-Optimized Startup & Compensating Rollback (`start_task`)**:
   - Resuming `"Paused"` tasks skips template inspection queries, avoiding unnecessary network latency.
   - Initial startup for `"Not started"` tasks checks `TEMPLATE_MARKER_HEADING` to idempotently inject execution checklists without creating duplicate blocks.
+  - **Template Injection Retry & Compensating Rollback**: If template injection fails after status transition, `start_task` automatically retries up to 3 times with exponential backoff. If all attempts fail, it executes a compensating rollback reverting the task status back to its original state (e.g. `'Not started'`) and raises `NotionServiceError`, preventing orphaned tasks in `'In progress'` without their checklist.
 
 ---
 
@@ -142,12 +143,23 @@ sequenceDiagram
     Engine>>App: Sorted & Pinned Task Queue
     App>>User: Renders Top 3 Arena + Backlog Drawer
 
-    opt User clicks "Start Task" (Unstarted)
+    opt User clicks "Start Task" (Unstarted with Retry & Rollback)
         User>>App: Click 'Start'
         App>>Notion: start_task(id, current_status='Not started')
-        Notion>>Retry: update_task_status + inject_template_blocks_if_empty
-        Retry>>API: PATCH /v1/pages/{id} & POST /v1/blocks/{id}/children
-        App>>User: Refreshes with task pinned in focus & checklist initialized
+        Notion>>Retry: update_task_status('In progress')
+        Retry>>API: PATCH /v1/pages/{id}
+        loop Template Injection Retry (Up to 3 attempts)
+            Notion>>Retry: inject_template_blocks_if_empty(id)
+            Retry-->>API: POST /v1/blocks/{id}/children
+        end
+        alt All Template Injection Attempts Fail
+            Notion->>Retry: Compensating Rollback: update_task_status('Not started')
+            Retry->>API: PATCH /v1/pages/{id} (Reverted)
+            Notion-->>App: Raises NotionServiceError
+            App-->>User: Displays error notification; task remains Not started
+        else Template Injected Successfully
+            App>>User: Refreshes with task pinned in focus & checklist initialized
+        end
     end
 
     opt User clicks "Resume Task" (Paused)
@@ -184,14 +196,44 @@ The **State Anchor Protocol** solves this:
 
 ---
 
-## 5. Concurrency Model & Capacity Guardrails
+## 5. Concurrency Model & Backend-Controlled Counter Strategy
 
-### 5.1 Advisory Task Capacity Limit (`MAX_ACTIVE_TASKS`)
-- **Limitation**: The Notion REST API is a remote service without distributed transactional table locks across isolated client sessions.
-- **Design Choice**: `MAX_ACTIVE_TASKS` (default: 50, configurable from 1 to 500) is enforced as an **advisory application-level guardrail** in `create_new_task()` to prevent cognitive queue saturation.
-- **Robust Configuration**: `config._parse_max_active_tasks` validates environment inputs on startup, rejecting non-integers or out-of-bounds numbers with actionable error messages.
+### 5.1 Backend Concurrency Coordinator (`TaskCapacityCoordinator`)
+- **Problem**: When multiple user sessions simultaneously invoke task creation near capacity, a naive read-then-create (`fetch_active_tasks -> create_task`) sequence can suffer from race conditions (Time-of-Check to Time-of-Use / TOCTOU), allowing multiple concurrent requests to pass the count check and overshoot `MAX_ACTIVE_TASKS`.
+- **Solution**: The backend implements `TaskCapacityCoordinator` utilizing a thread-safe mutual exclusion lock (`threading.Lock`):
+  1. **Atomic Reservation**: Acquires the lock before reading active tasks.
+  2. **Capacity Assertion**: If $\text{Active Tasks} \ge \text{MAX\_ACTIVE\_TASKS}$, immediately aborts and raises `TaskLimitError` before initiating any Notion REST calls.
+  3. **Synchronized Creation**: Executes Notion page creation and invalidates the cached task list within the critical section.
+  4. **Strict Capacity Enforcement**: Eliminates concurrent creation interleaving across multi-threaded Streamlit user sessions.
 
-### 5.2 Server-Side Logging & Client Error Sanitization
+```mermaid
+sequenceDiagram
+    autonumber
+    actor ClientA as Session A
+    actor ClientB as Session B
+    participant Coord as TaskCapacityCoordinator (Mutex)
+    participant Service as Notion Service Layer
+    participant Notion as Notion API
+
+    par Simultaneous Creation Requests
+        ClientA->>Coord: reserve_and_create(Task A)
+        ClientB->>Coord: reserve_and_create(Task B)
+    end
+
+    Note over Coord: Session A acquires lock first
+    Coord->>Service: count_active_tasks() [count = 49]
+    Coord->>Notion: create_task(Task A) [200 OK]
+    Note over Coord: Session A completes & releases lock
+
+    Note over Coord: Session B acquires lock
+    Coord->>Service: count_active_tasks() [count = 50]
+    Coord-->>ClientB: Raises TaskLimitError (Capacity Reached)
+```
+
+### 5.2 Config & Bounds Validation
+- `config._parse_max_active_tasks` validates `MAX_ACTIVE_TASKS` on startup, enforcing valid positive integers within range ($1 \le \text{MAX\_ACTIVE\_TASKS} \le 500$) with actionable error messages for malformed environment deployments.
+
+### 5.3 Server-Side Logging & Client Error Sanitization
 - All unexpected errors and external API failures are logged server-side via Python's standard `logging` library (`logger.exception()`) with full stack traces.
 - Presentation layers in `app.py` expose sanitized, user-friendly feedback to prevent leaking sensitive API tokens, database IDs, or internal network topology.
 
