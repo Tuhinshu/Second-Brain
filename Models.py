@@ -1,9 +1,16 @@
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
-from datetime import datetime
 
 TaskStatus = Literal["Backlog", "Not started", "In progress", "Paused", "Done"]
 TaskDomain = Literal["AIESEC", "Academics", "Clients", "Personal"]
+
+VALID_STATE_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    "Not started": {"In progress", "Backlog", "Done"},
+    "In progress": {"Paused", "Done", "Not started"},
+    "Paused": {"In progress", "Done", "Not started"},
+    "Backlog": {"Not started", "Done", "In progress"},
+    "Done": {"Not started", "Backlog", "In progress"},
+}
 
 class TaskModel(BaseModel):
     id: Optional[str] = None
@@ -15,8 +22,6 @@ class TaskModel(BaseModel):
     estimated_hours: float = Field(default=1.0, ge=0.25, le=12.0)
     someone_waiting: bool = False
     state_anchor: Optional[str] = None
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
     priority_score: Optional[float] = 0.0
 
 class AssetModel(BaseModel):

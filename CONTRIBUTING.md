@@ -1,85 +1,109 @@
-  Contributing to Second Brain Execution Engine
+# Contributing to Second Brain Execution Engine
 
-Thank you for your interest in contributing to the *Second Brain Execution Engine*! We welcome bug reports, feature suggestions, architecture enhancements, and code contributions.
+Thank you for your interest in contributing to the **Second Brain Execution Engine**! We welcome bug reports, feature suggestions, architecture enhancements, and code contributions.
 
+---
 
-
-  Code of Conduct
+## Code of Conduct
 
 Please maintain a welcoming, inclusive, and professional environment for everyone. Respect different viewpoints and focus on constructive feedback.
 
+---
 
+## Getting Started
 
-  Getting Started
+1. **Fork the Repository** on GitHub: [https://github.com/Tuhinshu/Second-Brain](https://github.com/Tuhinshu/Second-Brain)
+2. **Clone your fork** locally:
+   ```bash
+   git clone https://github.com/your-username/Second-Brain.git
+   cd Second-Brain
+   ```
 
-1. *Fork the Repository* on GitHub.
-2. *Clone your fork* locally:
-   bash
-   git clone https://github.com/yourusername/SecondBrain.git
-   cd SecondBrain
-   
-3. *Create a Virtual Environment*:
-   bash
-   python m venv .venv
-    Windows (PowerShell):
+3. **Create and activate a virtual environment**:
+   ```bash
+   python -m venv .venv
+
+   # Windows (PowerShell):
    .venv\Scripts\Activate.ps1
-    macOS / Linux:
+
+   # Windows (cmd.exe):
+   .venv\Scripts\activate.bat
+
+   # macOS / Linux:
    source .venv/bin/activate
-   
-4. *Install Dependencies*:
-   bash
-   pip install r requirements.txt
-   
-5. *Set Up Environment Variables*:
-   bash
+   ```
+
+4. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+5. **Set up environment variables**:
+   ```bash
+   # Copy template
    cp .env.example .env
-    Populate .env with your Notion API credentials
-   
 
+   # Populate .env with your Notion credentials:
+   # NOTION_API_KEY=ntn_...
+   # NOTION_TASKS_DB_ID=...
+   # NOTION_ASSETS_DB_ID=...
+   ```
 
+---
 
-  Development Workflow
+## Development Workflow
 
-1. Create a descriptive feature branch:
-   bash
-   git checkout b feature/yourfeaturename
-    or
-   git checkout b fix/issuedescription
-   
+1. **Create a descriptive feature branch**:
+   ```bash
+   git checkout -b feature/your-feature-name
+   # or
+   git checkout -b fix/issue-description
+   ```
 
-2. Follow codebase conventions:
-    Use strict type annotations wherever possible.
-    Use Pydantic models for data parsing and validation.
-    Maintain separation of concerns between notion_service.py, scoring_engine.py, Models.py, and app.py.
-    Never commit .env or sensitive Notion tokens.
+2. **Follow codebase conventions**:
+   - Use strict type annotations throughout (`typing.Optional`, `typing.Literal`, `typing.Callable`).
+   - Use Pydantic models in `Models.py` for data validation.
+   - Maintain clear separation of concerns:
+     - `notion_service.py`: Notion API interactions, retries, and data extraction.
+     - `scoring_engine.py`: Pure deterministic mathematical ranking algorithms.
+     - `Models.py`: Pydantic data models and state transitions.
+     - `config.py`: Environment variable loading and validation.
+     - `app.py`: Streamlit presentation components and user interaction flows.
+   - **Never commit `.env` or sensitive API keys.**
 
-3. Test your changes locally:
-   bash
+3. **Code Quality & Verification**:
+   Before submitting your changes, verify compilation and test locally:
+   ```bash
+   # 1. Verify Python syntax and compilation
+   python -m py_compile app.py config.py notion_service.py Models.py scoring_engine.py
+
+   # 2. Run the Streamlit development server
    streamlit run app.py
-   
+   ```
 
-4. Commit your changes with clear, semantic commit messages:
-   bash
-   git commit m "feat: add domain color coding to task cards"
-   
+4. **Commit your changes with clear semantic messages**:
+   ```bash
+   git add .
+   git commit -m "feat: add domain color coding to task cards"
+   ```
 
-5. Push to your fork and submit a Pull Request:
-   bash
-   git push origin feature/yourfeaturename
-   
+5. **Push to your fork and submit a Pull Request**:
+   ```bash
+   git push origin feature/your-feature-name
+   ```
 
+---
 
+## Suggestions for Contributions
 
-  Suggestions for Contributions
+- [ ] Mobile responsive layout optimizations
+- [ ] Integration with Notion Calendar / Due Dates
+- [ ] Time tracking stopwatch / Pomodoro timer integration
+- [ ] Analytics dashboard for completed tasks & velocity trends
+- [ ] Subtask / dependency tree support
 
- [ ] Mobile responsive layout optimizations
- [ ] Integration with Notion Calendar / Due Dates
- [ ] Time tracking stopwatch / Pomodoro timer integration
- [ ] Analytics dashboard for completed tasks & velocity trends
- [ ] Subtask / dependency tree support
+---
 
-
-
-  License
+## License
 
 By contributing to this project, you agree that your contributions will be licensed under the project's [MIT License](LICENSE).
