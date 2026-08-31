@@ -57,7 +57,7 @@ flowchart TD
     end
 
     subgraph Core_Engine ["Core Logic & Validation"]
-        Models["Pydantic Models (models.py)"]
+        Models["Pydantic Models (Models.py)"]
         Scoring["Dynamic Scoring Engine (scoring_engine.py)"]
         Config["Environment Configuration (config.py)"]
     end
@@ -121,8 +121,9 @@ python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
 
-# Install dependencies
+# Install dependencies (standard or deterministic production lockfile)
 pip install -r requirements.txt
+# or: pip install -r requirements-lock.txt
 ```
 
 ### 2. Configure Environment Variables
@@ -152,7 +153,7 @@ Configure your Notion Tasks table with the following exact property names:
 | Property Name | Property Type | Options / Format |
 | :--- | :--- | :--- |
 | **Task Name** | Title | Text |
-| **Status** | Status / Select | `Not started`, `In progress`, `Paused`, `Done`, `Backlog` |
+| **Status** | Status | `Not started`, `In progress`, `Paused`, `Done`, `Backlog` |
 | **Domain** | Select | `AIESEC`, `Academics`, `Clients`, `Personal` |
 | **Impact** | Number | 1 – 5 |
 | **Urgency** | Number | 1 – 5 |
