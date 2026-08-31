@@ -6,6 +6,27 @@ from collections.abc import Callable
 
 import streamlit as st
 
+import streamlit as st
+
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        pwd = st.text_input("Enter Passcode to Access HUD:", type="password")
+        if st.button("Authenticate"):
+            if pwd == st.secrets.get("APP_PASSWORD", "my_secret_pass"):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Access Denied")
+        return False
+    return True
+
+if not check_password():
+    st.stop()
+
+
 from Models import (
     InvalidStateTransitionError,
     NotionServiceError,
