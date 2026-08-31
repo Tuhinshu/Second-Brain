@@ -38,6 +38,29 @@ RETRYABLE_NETWORK_EXCEPTIONS = (
 notion = Client(auth=config.NOTION_API_KEY)
 
 
+def _extract_retry_after(err: Exception) -> float | None:
+    """
+    Extracts and parses the 'Retry-After' header from an APIResponseError or HTTP exception,
+    returning the delay in seconds if present and valid.
+    """
+    headers = getattr(err, "headers", None)
+    if headers is None:
+        return None
+
+    retry_after_raw = None
+    if hasattr(headers, "get") or isinstance(headers, dict):
+        retry_after_raw = headers.get("retry-after") or headers.get("Retry-After")
+
+    if retry_after_raw is not None:
+        try:
+            val = float(retry_after_raw)
+            if val >= 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def execute_with_retry(
     operation: Callable[[], T],
     max_retries: int = 3,
@@ -48,6 +71,10 @@ def execute_with_retry(
     Executes a Notion API call with bounded exponential backoff and jitter,
     strictly restricted to explicit retryable exception classes (APIResponseError
     with retryable HTTP status code, or explicit network/timeout exceptions).
+
+    Rate Limiting:
+        When a 429 rate limit is encountered, prefers the server-provided 'Retry-After'
+        header delay when available before falling back to exponential backoff.
     """
     attempt = 0
     while True:
@@ -58,7 +85,11 @@ def execute_with_retry(
             if status not in RETRYABLE_STATUS_CODES or attempt >= max_retries:
                 raise
             attempt += 1
-            delay = min(max_delay, base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.1))
+            retry_after = _extract_retry_after(err)
+            if retry_after is not None:
+                delay = min(max_delay, max(0.0, retry_after) + random.uniform(0, 0.05))
+            else:
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.1))
             time.sleep(delay)
         except RETRYABLE_NETWORK_EXCEPTIONS:
             if attempt >= max_retries:
@@ -505,24 +536,34 @@ def start_task(
                 else "Not started"
             )
             logger.error(
-                "Template injection failed after %d attempts for task %s. Rolling back status to '%s'.",
+                "Template injection failed after %d attempts for task %s. Attempting compensating rollback to '%s'.",
                 max_template_retries,
                 page_id,
                 rollback_status,
             )
+            rollback_succeeded = False
             try:
                 update_task_status(page_id, rollback_status, current_status="In progress")
+                rollback_succeeded = True
             except Exception as rollback_err:
                 logger.critical(
-                    "Compensating rollback failed for task %s: %s",
+                    "UNRECOVERABLE STATE INCONSISTENCY: Compensating rollback to '%s' failed for task %s after template injection failure. Task remains in 'In progress' without template: %s",
+                    rollback_status,
                     page_id,
                     str(rollback_err),
+                    exc_info=True,
                 )
 
-            raise NotionServiceError(
-                f"Failed to initialize checklist template for task. "
-                f"Status was safely rolled back to '{rollback_status}'."
-            ) from template_error
+            if rollback_succeeded:
+                raise NotionServiceError(
+                    f"Failed to initialize checklist template for task. "
+                    f"Status was safely rolled back to '{rollback_status}'."
+                ) from template_error
+            else:
+                raise NotionServiceError(
+                    f"Failed to initialize checklist template for task and automated status rollback to '{rollback_status}' failed. "
+                    f"Task may remain in 'In progress' in Notion."
+                ) from template_error
 
 
 @st.cache_data(ttl=60)

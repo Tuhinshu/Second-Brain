@@ -18,6 +18,7 @@ from Models import (
 )
 from notion_service import (
     TaskCapacityCoordinator,
+    _extract_retry_after,
     create_new_task,
     create_task,
     delete_task,
@@ -29,6 +30,45 @@ from notion_service import (
 
 
 class TestNotionServiceMocked(unittest.TestCase):
+    def test_extract_retry_after(self):
+        class ErrWithHeaders(Exception):
+            def __init__(self, headers):
+                self.headers = headers
+
+        self.assertIsNone(_extract_retry_after(Exception("No headers")))
+        self.assertIsNone(_extract_retry_after(ErrWithHeaders(None)))
+        self.assertIsNone(_extract_retry_after(ErrWithHeaders({"retry-after": "invalid"})))
+        self.assertIsNone(_extract_retry_after(ErrWithHeaders({"retry-after": "-5"})))
+        self.assertEqual(_extract_retry_after(ErrWithHeaders({"retry-after": "2.5"})), 2.5)
+        self.assertEqual(_extract_retry_after(ErrWithHeaders(httpx.Headers({"Retry-After": "3.0"}))), 3.0)
+
+    @patch("time.sleep")
+    def test_execute_with_retry_honors_retry_after_header(self, mock_sleep):
+        attempts = 0
+
+        def rate_limited_op():
+            nonlocal attempts
+            attempts += 1
+            if attempts < 2:
+                headers = httpx.Headers({"Retry-After": "1.75"})
+                raise APIResponseError(
+                    code="rate_limited",
+                    status=429,
+                    message="Rate limited",
+                    headers=headers,
+                    raw_body_text="{}",
+                )
+            return "recovered_with_header"
+
+        result = execute_with_retry(rate_limited_op, max_retries=3, base_delay=0.1)
+        self.assertEqual(result, "recovered_with_header")
+        self.assertEqual(attempts, 2)
+        mock_sleep.assert_called_once()
+        sleep_duration = mock_sleep.call_args[0][0]
+        # Should be approximately 1.75s (plus jitter between 0 and 0.05), NOT base_delay 0.1s
+        self.assertGreaterEqual(sleep_duration, 1.75)
+        self.assertLess(sleep_duration, 1.85)
+
     def test_execute_with_retry_recovers_on_429(self):
         attempts = 0
 
@@ -259,6 +299,39 @@ class TestNotionServiceMocked(unittest.TestCase):
         self.assertEqual(mock_update.call_count, 2)
         mock_update.assert_any_call("page-123", "In progress", current_status="Not started")
         mock_update.assert_any_call("page-123", "Not started", current_status="In progress")
+
+    @patch("time.sleep")
+    @patch("notion_service.inject_template_blocks_if_empty")
+    @patch("notion_service.update_task_status")
+    def test_start_task_secondary_rollback_failure_logs_critical_and_raises(
+        self, mock_update, mock_inject, mock_sleep
+    ):
+        mock_inject.side_effect = Exception("Persistent API error")
+
+        # First call to update_task_status (transition to In progress) succeeds.
+        # Second call to update_task_status (compensating rollback) fails.
+        update_calls = 0
+
+        def update_effect(pid, status, current_status=None):
+            nonlocal update_calls
+            update_calls += 1
+            if update_calls == 2:
+                raise Exception("Notion API completely unreachable during rollback")
+
+        mock_update.side_effect = update_effect
+
+        with (
+            self.assertLogs("second_brain.service", level="CRITICAL") as cm,
+            self.assertRaises(NotionServiceError) as ctx,
+        ):
+            start_task("page-123", current_status="Not started", max_template_retries=3)
+
+        self.assertIn("automated status rollback to 'Not started' failed", str(ctx.exception))
+        self.assertIn("Task may remain in 'In progress'", str(ctx.exception))
+        self.assertTrue(
+            any("UNRECOVERABLE STATE INCONSISTENCY" in log for log in cm.output),
+            f"Expected UNRECOVERABLE STATE INCONSISTENCY log, got: {cm.output}",
+        )
 
 
 if __name__ == "__main__":

@@ -143,13 +143,14 @@ Where:
 - Translates Notion's nested property structures (`Title`, `Select`, `Status`, `Number`, `Checkbox`, `Rich Text`) into strongly-typed Pydantic models with defensive property extractors (`_parse_int_prop`, `_parse_float_prop`, `_extract_plain_text`).
 - **Transient Fault Tolerance (`execute_with_retry`)**:
   - Automatically handles HTTP `429` (Rate Limited), `500`, `502`, `503`, `504` status codes and explicit network timeout errors.
+  - **`Retry-After` Header Prioritization**: When an HTTP 429 rate limit is encountered, `execute_with_retry` extracts and respects the server-specified `Retry-After` header value (bounded by `max_delay` + jitter) before falling back to calculated exponential backoff.
   - Restricted strictly to explicit retryable classes: `APIResponseError` (with retryable status) and `RETRYABLE_NETWORK_EXCEPTIONS` (`RequestTimeoutError`, `httpx.TimeoutException`, `httpx.NetworkError`, `ConnectionError`, `TimeoutError`). Non-retryable exceptions bubble up immediately.
   - Applies bounded exponential backoff with randomized jitter:
     $$\text{Delay} = \min(\text{base\_delay} \times 2^{\text{attempt}-1} + \text{jitter}, \text{max\_delay})$$
 - **Performance-Optimized Startup & Compensating Rollback (`start_task`)**:
   - Resuming `"Paused"` tasks skips template inspection queries, avoiding unnecessary network latency.
   - Initial startup for `"Not started"` tasks checks `TEMPLATE_MARKER_HEADING` to idempotently inject execution checklists without creating duplicate blocks.
-  - **Template Injection Retry & Compensating Rollback**: If template injection fails after status transition, `start_task` automatically retries up to 3 times with exponential backoff. If all attempts fail, it executes a compensating rollback reverting the task status back to its original state (e.g. `'Not started'`) and raises `NotionServiceError`, preventing orphaned tasks in `'In progress'` without their checklist.
+  - **Template Injection Retry & Compensating Rollback**: If template injection fails after status transition, `start_task` automatically retries up to 3 times with exponential backoff. If all attempts fail, it executes a compensating rollback reverting the task status back to its original state (e.g. `'Not started'`) and raises `NotionServiceError`, preventing orphaned tasks in `'In progress'` without their checklist. If the compensating rollback itself fails (secondary failure), the engine logs a high-severity `logger.critical` alert (`UNRECOVERABLE STATE INCONSISTENCY`) with full traceback and informs the caller that the task may remain inconsistent in Notion.
 
 ---
 
@@ -307,17 +308,17 @@ The project includes an automated Continuous Integration pipeline ([`.github/wor
 graph LR
     Push[Git Push / PR] --> Lint[Static Lint & Style Gate<br>Ruff Analyzer & Formatter]
     Lint --> Compile[Python Bytecode Compilation<br>py_compile]
-    Compile --> TestSuite[Automated Test Suite<br>42 Unit & Mocked Integration Tests]
+    Compile --> TestSuite[Automated Test Suite<br>45 Unit & Mocked Integration Tests]
     TestSuite --> SecurityScan[Secret Scanning Gate<br>Gitleaks Analyzer]
     SecurityScan --> Deploy[Ready for Deployment]
 ```
 
 1. **Static Linting & Style Gate (Ruff)**: Enforces Python code hygiene, style consistency (PEP 8), import sorting (`isort`), modern Python 3.11 idiom upgrades (`pyupgrade`), and defect prevention (`flake8-bugbear`, `flake8-comprehensions`, `flake8-simplify`).
 2. **Bytecode Compilation**: Validates syntax across all source files via `python -m py_compile`.
-3. **Automated Test Suite**: Executes 42 comprehensive unit and integration tests across:
+3. **Automated Test Suite**: Executes 45 comprehensive unit and integration tests across:
    - `test_models.py` (6 tests): Data models, bounds validation, and state machine transitions.
    - `test_scoring_engine.py` (4 tests): Multi-factor priority calculations and pinning rules.
    - `test_notion_parsing.py` (8 tests): Defensive Notion JSON property extractors, fallback log emissions, and markdown escaping.
-   - `test_notion_service.py` (20 tests): Retry wrappers, explicit exception filtering, concurrency coordinator thread safety, template injection idempotency, retry/compensating rollback, and status updates.
+   - `test_notion_service.py` (23 tests): Retry wrappers, Retry-After header prioritization, explicit exception filtering, concurrency coordinator thread safety, template injection idempotency, retry/compensating rollback, secondary rollback failure handling, and status updates.
    - `test_config.py` (4 tests): Environment configuration bounds, positive integer parsing, and actionable error messages.
 4. **Automated Secret Scanning**: Runs `gitleaks` across the commit history to enforce zero-secret commitments.
